@@ -1,12 +1,12 @@
-import { opencodeConfig } from "../opencode/opencodeConfig";
-import { opencodeIdentity } from "../opencode/opencodeIdentity";
-import { AgentCompletionRequestType } from "../../types/agent_types/agent_request";
-import { AgentCompletionResponse } from "../../types/agent_types/agent_response";
+import { opencodeConfig } from "../../opencode/opencodeConfig";
+import { opencodeIdentity } from "../../opencode/opencodeIdentity";
+import { AgentCompletionRequestType } from "../../../types/agent_types/agent_request";
+import { AgentCompletionResponse } from "../../../types/agent_types/agent_response";
 import {
   AgentErrorResponseSchema,
   createAgentErrorResponse,
   AgentErrorResponse,
-} from "../../types/agent_types/agent_error";
+} from "../../../types/agent_types/agent_error";
 
 export class LlmCallAdapter {
   constructor() {}
@@ -119,7 +119,7 @@ export class LlmCallAdapter {
 
 // verifikasi bentuk request openhands-sdk. [AMAN]
 // verifikasi juga bentuk respon yang bisa diterima. [AMAN] error skema juga aman [AMAN]
-// 
+//
 // verifikasi request yang bisa diterima oleh opencode [AMAN]
 // verifikasi juga bentuk respon yang dikirim oleh opencode [AMAN]
 //

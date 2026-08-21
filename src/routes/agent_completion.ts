@@ -2,7 +2,7 @@ import { Request, Response, NextFunction, RequestHandler } from "express";
 import { AgentCompletionRequest } from "../types/agent_types/agent_request";
 import { createAgentErrorResponse } from "../types/agent_types/agent_error";
 import { OpencodeProvider } from "../providers/opencode/opencodeProvider";
-import { LlmCallAdapter } from "../providers/adapter/llmCallAdapter";
+import { LlmCallAdapter } from "../providers/adapter/llm/llmCallAdapter";
 
 const adapter = new LlmCallAdapter();
 
@@ -25,7 +25,7 @@ export const agent_completion: RequestHandler = async (
   }
 
   const bestModel = OpencodeProvider.getBestModel();
-  console.log(`best model: ${JSON.stringify(bestModel)}`)
+  console.log(`best model: ${JSON.stringify(bestModel)}`);
 
   if (!bestModel) {
     const errorResp = createAgentErrorResponse(
