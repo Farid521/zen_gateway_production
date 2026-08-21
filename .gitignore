@@ -2,3 +2,4 @@ node_modules/
 dist/
 opencode.json
 openhands-schema-test/
+.env

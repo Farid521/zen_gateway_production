@@ -1,43 +1,22 @@
-/**
- * Represents the usage information for a single API key.
- */
-interface KeyInfo {
-  /** Unique identifier for the key */
-  id: number;
-  /** The actual API key string */
-  key: string;
-  /** Number of times this key has been used */
-  used: number;
-}
+import {
+  TavilyKeyInfo,
+  TavilyKeySession,
+  TAVILY_USAGE_LIMIT,
+  TAVILY_EXHAUSTED_USED_COUNT,
+} from "./tavilyConfig";
 
-/**
- * Represents a Tavily API key session returned to consumers.
- */
-export interface TavilyKeySession {
-  /** The API key to use for the current request */
-  key: string;
-}
+export type { TavilyKeySession } from "./tavilyConfig";
 
-/**
- * Singleton provider that manages and distributes Tavily API keys.
- * Implements a round-robin strategy based on least usage to distribute load across keys.
- */
 class TavilyProvider {
   private static instance: TavilyProvider | null = null;
-  private usageRecords: KeyInfo[] = [];
+  private usageRecords: TavilyKeyInfo[] = [];
 
-  /**
-   * Private constructor to prevent direct instantiation.
-   * Initializes the provider by loading keys from environment variables.
-   */
+
   private constructor() {
     this.loadKeysFromEnv();
   }
 
-  /**
-   * Loads API keys from the TAVILY_KEY environment variable.
-   * Expects a comma-separated list of keys.
-   */
+
   private loadKeysFromEnv(): void {
     const rawKeys = process.env.TAVILY_KEY;
 
@@ -53,6 +32,8 @@ class TavilyProvider {
       .map((k) => k.trim())
       .filter((k) => k.length > 0);
 
+    console.log(keysList)
+
     this.usageRecords = keysList.map((key, index) => ({
       id: index + 1,
       key,
@@ -60,10 +41,6 @@ class TavilyProvider {
     }));
   }
 
-  /**
-   * Returns the singleton instance of TavilyProvider.
-   * Creates the instance on first call if it doesn't exist.
-   */
   public static getInstance(): TavilyProvider {
     if (!TavilyProvider.instance) {
       TavilyProvider.instance = new TavilyProvider();
@@ -72,24 +49,20 @@ class TavilyProvider {
     return TavilyProvider.instance;
   }
 
-  /**
-   * Retrieves the least-used API key.
-   *
-   * The usage counter is incremented immediately when a key is allocated,
-   * not after the API request completes.
-   */
   public getTavilyKey(): TavilyKeySession {
     const availableRecords = this.usageRecords.filter(
-      (record) => record.used < 850,
+      (record) => record.used < TAVILY_USAGE_LIMIT,
     );
 
+    // Return sentinel value instead of throwing to stay consistent with other providers; error handling is delegated to the adapter.
     if (availableRecords.length === 0) {
-      throw new Error(
-        "No Tavily API keys available or all keys have reached the usage limit (850).",
-      );
+      return {
+        key: "",
+        usedCount: TAVILY_EXHAUSTED_USED_COUNT
+      };
     }
 
-    // Find the key with the least usage
+    // Select the least-used available key
     const selectedRecord = availableRecords.reduce(
       (min, record) => (record.used < min.used ? record : min),
       availableRecords[0],
@@ -99,13 +72,11 @@ class TavilyProvider {
 
     return {
       key: selectedRecord.key,
+      usedCount: selectedRecord.used
     };
   }
 
-  /**
-   * Returns the usage records for all loaded API keys.
-   */
-  public getUsageRecords(): KeyInfo[] {
+  public getUsageRecords(): TavilyKeyInfo[] {
     return this.usageRecords;
   }
 }
