@@ -1,12 +1,12 @@
-import { opencodeConfig } from "../../opencode/opencodeConfig";
-import { opencodeIdentity } from "../../opencode/opencodeIdentity";
-import { AgentCompletionRequestType } from "../../../types/agent_types/agent_request";
-import { AgentCompletionResponse } from "../../../types/agent_types/agent_response";
+import { opencodeConfig } from "../../providers/opencode/opencodeConfig";
+import { opencodeIdentity } from "../../providers/opencode/opencodeIdentity";
+import { AgentCompletionRequestType } from "../../types/agent_types/agent_request";
+import { AgentCompletionResponse } from "../../types/agent_types/agent_response";
 import {
   AgentErrorResponseSchema,
   createAgentErrorResponse,
   AgentErrorResponse,
-} from "../../../types/agent_types/agent_error";
+} from "../../types/agent_types/agent_error";
 
 export class LlmCallAdapter {
   constructor() {}

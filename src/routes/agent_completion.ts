@@ -2,7 +2,7 @@ import { Request, Response, NextFunction, RequestHandler } from "express";
 import { AgentCompletionRequest } from "../types/agent_types/agent_request";
 import { createAgentErrorResponse } from "../types/agent_types/agent_error";
 import { OpencodeProvider } from "../providers/opencode/opencodeProvider";
-import { LlmCallAdapter } from "../providers/adapter/llm/llmCallAdapter";
+import { LlmCallAdapter } from "../driver/llm/llmCallDriver";
 
 const adapter = new LlmCallAdapter();
 
