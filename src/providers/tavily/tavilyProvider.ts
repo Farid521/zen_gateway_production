@@ -1,84 +1,123 @@
 import {
-  TavilyKeyInfo,
-  TavilyKeySession,
   TAVILY_USAGE_LIMIT,
-  TAVILY_EXHAUSTED_USED_COUNT,
-} from "./tavilyConfig";
+  TAVILY_EXHAUSTED_USE_COUNT,
+  TavilyApiKeyRecord,
+  TavilyApiKeySession,
+} from "./tavilyConfig"
 
-export type { TavilyKeySession } from "./tavilyConfig";
+export class TavilyProvider {
+  private static instance: TavilyProvider | null = null
+  private records: TavilyApiKeyRecord[] | null = null
 
-class TavilyProvider {
-  private static instance: TavilyProvider | null = null;
-  private usageRecords: TavilyKeyInfo[] = [];
+  private constructor() {}
 
-
-  private constructor() {
-    this.loadKeysFromEnv();
-  }
-
-
-  private loadKeysFromEnv(): void {
-    const rawKeys = process.env.TAVILY_KEY;
-
-    if (!rawKeys) {
-      console.warn(
-        "Warning: TAVILY_KEY not found in environment variables.",
-      );
-      return;
-    }
-
-    const keysList = rawKeys
-      .split(",")
-      .map((k) => k.trim())
-      .filter((k) => k.length > 0);
-
-    console.log(keysList)
-
-    this.usageRecords = keysList.map((key, index) => ({
-      id: index + 1,
-      key,
-      used: 0,
-    }));
-  }
-
+  /**
+   * Returns the singleton instance of TavilyProvider.
+   */
   public static getInstance(): TavilyProvider {
     if (!TavilyProvider.instance) {
-      TavilyProvider.instance = new TavilyProvider();
+      TavilyProvider.instance = new TavilyProvider()
     }
-
-    return TavilyProvider.instance;
+    return TavilyProvider.instance
   }
 
-  public getTavilyKey(): TavilyKeySession {
-    const availableRecords = this.usageRecords.filter(
-      (record) => record.used < TAVILY_USAGE_LIMIT,
-    );
-
-    // Return sentinel value instead of throwing to stay consistent with other providers; error handling is delegated to the adapter.
-    if (availableRecords.length === 0) {
-      return {
-        key: "",
-        usedCount: TAVILY_EXHAUSTED_USED_COUNT
-      };
+  /**
+   * Initializes API key records from environment variables if not already initialized.
+   */
+  private initiateRecords(): void {
+    if (this.records !== null) {
+      return
     }
 
-    // Select the least-used available key
-    const selectedRecord = availableRecords.reduce(
-      (min, record) => (record.used < min.used ? record : min),
-      availableRecords[0],
-    );
+    const keys = this.getKeysFromEnv()
 
-    selectedRecord.used += 1;
+    this.records = keys.map((apiKey, index) => ({
+      id: index + 1,
+      apiKey,
+      useCount: 0,
+    }))
+  }
+
+  /**
+   * Retrieves API keys from the TAVILY_API_KEY environment variable.
+   * Expects a comma-separated list of keys (e.g. "tvly-aaa,tvly-bbb").
+   * Docs: Bearer tvly-YOUR_API_KEY (https://docs.tavily.com/documentation/api-reference/endpoint/search)
+   */
+  private getKeysFromEnv(): string[] {
+    const raw = process.env.TAVILY_API_KEY
+
+    if (!raw || raw.trim().length === 0) {
+      console.warn(
+        "Warning: TAVILY_API_KEY not found in environment variables."
+      )
+      return []
+    }
+
+    return raw
+      .split(",")
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0)
+      .filter((k, i, arr) => arr.indexOf(k) === i)
+  }
+
+  /**
+   * Returns the least-used API key and increments its usage count.
+   * Filters out keys that have reached the usage limit (500).
+   * Returns a sentinel session with empty apiKey if none available.
+   */
+  public getApiKey(): TavilyApiKeySession {
+    if (this.records === null) {
+      this.initiateRecords()
+    }
+
+    if (!this.records || this.records.length === 0) {
+      return {
+        apiKey: "",
+        useCount: TAVILY_EXHAUSTED_USE_COUNT,
+      }
+    }
+
+    const available = this.records.filter(
+      (record) => record.useCount < TAVILY_USAGE_LIMIT
+    )
+
+    if (available.length === 0) {
+      console.warn("no tavily api key available, all keys exhausted")
+      return {
+        apiKey: "",
+        useCount: TAVILY_EXHAUSTED_USE_COUNT,
+      }
+    }
+
+    const selected = available.reduce(
+      (min, record) => (record.useCount < min.useCount ? record : min),
+      available[0]
+    )
+
+    selected.useCount += 1
 
     return {
-      key: selectedRecord.key,
-      usedCount: selectedRecord.used
-    };
+      apiKey: selected.apiKey,
+      useCount: selected.useCount,
+    }
   }
 
-  public getUsageRecords(): TavilyKeyInfo[] {
-    return this.usageRecords;
+  /**
+   * Helper: returns Authorization header value for direct fetch usage.
+   * Example: "Bearer tvly-xxx"
+   * Note: this also increments usage via getApiKey().
+   */
+  public getAuthHeader(): string {
+    const { apiKey } = this.getApiKey()
+    return apiKey ? `Bearer ${apiKey}` : ""
+  }
+
+  /**
+   * Test helper: reset singleton (only for tests).
+   */
+  public static _resetForTest(): void {
+    TavilyProvider.instance = null
   }
 }
 
-export default TavilyProvider;
+export default TavilyProvider
