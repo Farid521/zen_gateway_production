@@ -6,7 +6,7 @@ import { z } from "zod";
 
 export const TavilyCrawlRequestSchema = z.object({
   /** The root URL to begin the crawl. */
-  url: z.string().min(1, "url must not be empty"),
+  url: z.string().url("Must be a valid URL").min(1, "url must not be empty"),
 
   /** Natural language instructions for the crawler (what to find). */
   instructions: z.string().optional(),
@@ -14,10 +14,14 @@ export const TavilyCrawlRequestSchema = z.object({
   /** Max depth of the crawl (1–5). Defines how far from base URL to explore. */
   max_depth: z.number().int().min(1).max(5).optional().default(1),
 
-  /** Max number of links to follow per level. */
-  max_breadth: z.number().int().min(1).max(50).optional().default(20),
+  /** Max number of links to follow per level (1–500). */
+  max_breadth: z.number().int().min(1).max(500).optional().default(20),
 
-  /** Total number of links the crawler will process before stopping. */
+  /**
+   * Total number of links the crawler will process before stopping.
+   * Local safeguard: capped at 100 to prevent excessive credit usage.
+   * The official Tavily API does not enforce a strict hard limit for this field.
+   */
   limit: z.number().int().min(1).max(100).optional().default(50),
 
   /** Regex patterns to restrict crawling to specific paths. */
@@ -33,7 +37,7 @@ export const TavilyCrawlRequestSchema = z.object({
   exclude_domains: z.array(z.string()).nullable().optional().default(null),
 
   /** Whether to allow crawling external domains. */
-  allow_external: z.boolean().optional().default(false),
+  allow_external: z.boolean().optional().default(true),
 
   /** Whether to include images in crawl results. */
   include_images: z.boolean().optional().default(false),
@@ -47,14 +51,11 @@ export const TavilyCrawlRequestSchema = z.object({
   /** Whether to include favicon URL for each result. */
   include_favicon: z.boolean().optional().default(false),
 
-  /** Max number of relevant chunks returned per source (1–3). */
-  chunks_per_source: z.number().int().min(1).max(3).optional().default(3),
-
-  /** Query to rerank chunks (alias for instructions-based ranking). */
-  query: z.string().optional(),
+  /** Max number of relevant chunks returned per source (1–5). */
+  chunks_per_source: z.number().int().min(1).max(5).optional().default(3),
 
   /** Maximum time in seconds to wait for crawl before timing out (10–150). */
-  timeout: z.number().int().min(10).max(150).optional().default(150),
+  timeout: z.number().min(10).max(150).optional().default(150),
 
   /** Whether to include credit usage information in the response. */
   include_usage: z.boolean().optional().default(false),
