@@ -116,14 +116,3 @@ export class LlmCallAdapter {
     }
   }
 }
-
-// verifikasi bentuk request openhands-sdk. [AMAN]
-// verifikasi juga bentuk respon yang bisa diterima. [AMAN] error skema juga aman [AMAN]
-//
-// verifikasi request yang bisa diterima oleh opencode [AMAN]
-// verifikasi juga bentuk respon yang dikirim oleh opencode [AMAN]
-//
-// verifikasi request yang bisa diterima gemini [AMAN]
-// verifikasi juga bentuk respon yang dikirim oleh gemini [AMAN]
-//
-// buat single openAi request manager []

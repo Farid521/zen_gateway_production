@@ -7,7 +7,6 @@ import {
 } from "./opencodeConfig";
 import { opencodeIdentity } from "./opencodeIdentity";
 
-// TODO: buat function untuk meminta model spesifik. function akan ambil model dari state
 
 export class OpencodeProvider {
   private static instance: OpencodeProvider | null = null;
@@ -17,6 +16,9 @@ export class OpencodeProvider {
 
   private constructor() {}
 
+  /**
+   * Returns the singleton instance, initializing the probe cycle on first call.
+   */
   static getInstance() {
     if (!OpencodeProvider.instance) {
       OpencodeProvider.instance = new OpencodeProvider();
@@ -26,10 +28,11 @@ export class OpencodeProvider {
   }
 
   /**
-   * Retrieves the best available model with the lowest latency.
-   * Filters out unavailable models and picks the one with minimum latencyMs.
+   * Returns the lowest-latency model that is currently available.
+   *
+   * Returns null when the provider has not been initialized or
+   * no model is currently available.
    */
-
   public static getBestModel(): BestModelResult | null {
     if (!OpencodeProvider.instance) {
       console.warn(
@@ -43,13 +46,11 @@ export class OpencodeProvider {
       return null;
     }
 
-    // Filter only available models
     const availableModels = state.availableModel.filter((m) => m.is_available);
     if (availableModels.length === 0) {
       return null;
     }
 
-    // Find the model with the lowest latency
     const best = availableModels.reduce((prev, curr) =>
       curr.latencyMs < prev.latencyMs ? curr : prev,
     );
@@ -62,16 +63,17 @@ export class OpencodeProvider {
   }
 
 
+  /**
+   * Schedules periodic probing of model availability.
+   */
   private static probeAvailableModelCron(): void {
-    // Clear any existing timer to avoid duplicate crons.
+    // Reset the existing timer before scheduling a new probe cycle.
     if (OpencodeProvider.probeTimer) {
       clearInterval(OpencodeProvider.probeTimer);
     }
 
-    // Run the initial probe immediately.
     OpencodeProvider.updateAvailableModelsState();
 
-    // Schedule periodic probes.
     OpencodeProvider.probeTimer = setInterval(() => {
       OpencodeProvider.updateAvailableModelsState();
     }, opencodeConfig.modelProbeInterval);
@@ -82,6 +84,13 @@ export class OpencodeProvider {
   }
 
 
+  /**
+   * Refreshes the cached model availability state.
+   *
+   * Skips the probe when a previous probe is still running.
+   * Models that are no longer returned by the provider are kept in the
+   * state but marked as unavailable.
+   */
   private static async updateAvailableModelsState(): Promise<void> {
     if (OpencodeProvider.isProbing) {
       console.warn(
@@ -122,7 +131,7 @@ export class OpencodeProvider {
         .map((prev) => ({
           model: prev.model,
           is_available: false,
-          latencyMs: Infinity, // fix #4
+          latencyMs: Infinity,
           checkedAt,
         }));
 
@@ -130,18 +139,21 @@ export class OpencodeProvider {
         availableModel: [...probeResults, ...missingProbeResults],
       };
     } finally {
-      // Selalu reset flag, bahkan kalau throw
+      // Reset the flag even when the probe throws.
       OpencodeProvider.isProbing = false;
     }
   }
 
 
+  /**
+   * Checks whether a model is usable and measures its response latency.
+   */
   private static async probeModel(
     modelName: string,
   ): Promise<ModelProbeResult> {
     const checkedAt = new Date().toISOString();
 
-    // AbortController + timer to enforce the request timeout from config.
+    // Abort when the request exceeds the configured timeout.
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(),
@@ -159,7 +171,7 @@ export class OpencodeProvider {
           Authorization: `Bearer ${opencodeConfig.apiKey}`,
           "Content-Type": "application/json",
 
-          // Identitas Klien & User Agent (Wajib untuk lolos validasi Zen)
+          // Required by the OpenCode endpoint for client/session validation.
           "User-Agent": "opencode/1.16.0",
           "x-opencode-client": "cli",
           "x-opencode-project": "global",
@@ -193,14 +205,17 @@ export class OpencodeProvider {
         checkedAt,
       };
     } finally {
-      // Always clear the timer so the event loop does not leak.
       clearTimeout(timer);
     }
   }
 
-  
+  /**
+   * Fetches the list of free models from the provider.
+   *
+   * Returns an empty array on timeout, network failure, or non-OK response.
+   */
   private static async getFreeModelName(): Promise<Model[]> {
-    // AbortController + timer to enforce the request timeout from config.
+    // Abort when the request exceeds the configured timeout.
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(),
@@ -214,7 +229,7 @@ export class OpencodeProvider {
         headers: {
           Authorization: `Bearer ${opencodeConfig.apiKey}`,
 
-          // Identitas Klien & User Agent (Wajib untuk lolos validasi Zen)
+          // Required by the OpenCode endpoint for client/session validation.
           "User-Agent": "opencode/1.16.0",
           "x-opencode-client": "cli",
           "x-opencode-project": "global",
@@ -224,7 +239,6 @@ export class OpencodeProvider {
       });
 
       if (!res.ok) {
-        // fetch network error
         console.warn(
           `[getFreeModelName] Failed to fetch free model names: ${res.status} ${res.statusText}`,
         );
@@ -233,7 +247,7 @@ export class OpencodeProvider {
 
       const data = await res.json();
 
-      // Keep only free models (id ending with "-free"), then normalize to Model.
+      // Keep only free-tier models.
       const freeModels: Model[] = data.data
         .filter((m: { id: string }) => m.id.endsWith("-free"))
         .map((m: { id: string }) => ({
@@ -242,7 +256,6 @@ export class OpencodeProvider {
 
       return freeModels;
     } catch (err) {
-      // timeout / network / parsing error: log and do not throw.
       if (err instanceof Error && err.name === "AbortError") {
         console.warn(
           `[getFreeModelName] Fetch free available models timed out after ${opencodeConfig.requestTimeout}ms`,
@@ -252,7 +265,6 @@ export class OpencodeProvider {
       }
       return [];
     } finally {
-      // Always clear the timer so the event loop does not leak.
       clearTimeout(timer);
     }
   }

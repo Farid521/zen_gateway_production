@@ -20,9 +20,7 @@ export const opencodeConfig: OpencodeConfig = {
   idRotationInterval: 15 * 60 * 1000,
 };
 
-// =======================================
-// OpenAi message schema
-// =======================================
+// OpenAI message schemas.
 
 export type Role = "system" | "user" | "assistant" | "tool";
 
@@ -97,9 +95,7 @@ export interface ChatCompletionResponse {
   cost?: string;
 }
 
-// ==============
-// available model interfaces
-// ==============
+// Model probe and availability interfaces.
 
 export interface ModelProbeResult {
   model: string;
