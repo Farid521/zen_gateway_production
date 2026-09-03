@@ -44,6 +44,7 @@ export const FinishReasonSchema = z.enum([
   "function_call",
   "insufficient_system_resource",
   "null",
+  "error",
 ]);
 export type FinishReason = z.infer<typeof FinishReasonSchema>;
 

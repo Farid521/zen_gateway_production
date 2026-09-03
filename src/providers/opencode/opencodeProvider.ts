@@ -153,12 +153,9 @@ export class OpencodeProvider {
   ): Promise<ModelProbeResult> {
     const checkedAt = new Date().toISOString();
 
-    // Abort when the request exceeds the configured timeout.
+    // ponytail: probe timeout 8s - jangan tunggu 60s per model, 8 model x 60s = hang
     const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(),
-      opencodeConfig.requestTimeout,
-    );
+    const timer = setTimeout(() => controller.abort(), 8_000);
 
     const startTime = performance.now();
 

@@ -3,6 +3,7 @@ dist/
 opencode.json
 openhands-schema-test/
 .env
+keys.txt
 
 # Local Tavily live tests (contain API keys, not for commit)
 test/tavily-*live*.ts

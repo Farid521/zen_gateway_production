@@ -1,5 +1,5 @@
 /**
- * Base URL Tavily API - dipakai driver nanti.
+ * Base URL Tavily API
  * Docs: https://docs.tavily.com/documentation/api-reference/endpoint/search
  * curl --url https://api.tavily.com/search --header 'Authorization: Bearer tvly-...'
  */
