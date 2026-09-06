@@ -8,7 +8,15 @@ import {
   createAgentError,
 } from "../../types/agent_types/agent_error";
 import { ReservedGeminiKey } from "../../providers/gemini/geminiProviderConfig";
-import { OpencodeProvider } from "../../providers/opencode/opencodeProvider";
+
+// ponytail: quota = 429 / RESOURCE_EXHAUSTED saja, sinyal lain tetap provider_error
+function isQuotaError(status: number, errorBody: any, message: string): boolean {
+  if (status === 429) return true;
+  const code = errorBody?.code;
+  const s = String(errorBody?.status ?? code ?? "");
+  if (code === 429 || s === "429" || s === "RESOURCE_EXHAUSTED") return true;
+  return /quota|rate.?limit|resource.?exhausted|exceeded/i.test(message ?? "");
+}
 
 export class LlmCallAdapter {
   constructor() {}
@@ -138,7 +146,10 @@ export class LlmCallAdapter {
     };
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), opencodeConfig.requestTimeout);
+    const timer = setTimeout(
+      () => controller.abort(),
+      opencodeConfig.requestTimeout,
+    );
     const startTime = performance.now();
 
     try {
@@ -165,16 +176,22 @@ export class LlmCallAdapter {
 
         // Extract error details, normalizing Gemini's array-wrapped error format and OpenAI's object format.
         // Example raw[0] from Gemini: [{ error: { code: 400, message: "Invalid JSON payload...", status: "INVALID_ARGUMENT", details: [...] } }]
-        const errorBody: any = Array.isArray(raw) ? raw[0]?.error : (raw as any)?.error;
+        const errorBody: any = Array.isArray(raw)
+          ? raw[0]?.error
+          : (raw as any)?.error;
         if (errorBody) {
           message = errorBody.message ?? message;
-          code = errorBody.code ?? code;
+          code = String(errorBody.code ?? errorBody.status ?? code);
           details = errorBody.details ?? raw;
         } else if (raw) {
           details = raw;
         }
 
         session.release();
+        // ponytail: bedakan kuota agar callWithFallback bisa fallback, tanpa retry/backoff
+        if (isQuotaError(res.status, errorBody, message)) {
+          throw createAgentError(message, "upstream_error", null, "quota_exhausted", details);
+        }
         throw createAgentError(message, "upstream_error", null, code, details);
       }
 
@@ -237,40 +254,16 @@ export class LlmCallAdapter {
     geminiSession: ReservedGeminiKey | null | undefined,
     opencodeSessionId?: string,
   ): Promise<AgentCompletionResponse> {
-    let lastError: any = null;
-
-    // 1. Gemini — jika session null/undefined langsung ke opencode
-    if (geminiSession) {
-      try {
-        return await this.callGeminiAdapter(request, geminiSession);
-      } catch (err: any) {
-        lastError = err;
-      }
-    } else {
-      lastError = createAgentError(
-        "Gemini session is required but was null or undefined",
-        "invalid_request_error",
-        null,
-        "missing_gemini_session",
-      );
+    // ponytail: hanya quota yang fallback ke opencode, error lain rethrow
+    if (!geminiSession) {
+      return this.opencodeCallAdapter(request.model, request, opencodeSessionId);
     }
-
-    // 2. Opencode — gunakan getBestModel() internal (fallback selalu)
-    // ponytail: jika gemini null karena pool habis, jangan throw 400 missing_gemini_session - fallback ke opencode dulu, hanya 503 jika opencode juga null
-    const bestModel = OpencodeProvider.getBestModel();
-    if (!bestModel) {
-      if (lastError && lastError?.error?.code !== "missing_gemini_session") throw lastError;
-      throw createAgentError(
-        "No available model found. Please try again later.",
-        "service_unavailable",
-        null,
-        "no_model_available",
-      );
-    }
-
     try {
-      return await this.opencodeCallAdapter(bestModel.model, request, opencodeSessionId);
+      return await this.callGeminiAdapter(request, geminiSession);
     } catch (err: any) {
+      if (err instanceof AgentError && err.error.code === "quota_exhausted") {
+        return this.opencodeCallAdapter(request.model, request, opencodeSessionId);
+      }
       throw err;
     }
   }

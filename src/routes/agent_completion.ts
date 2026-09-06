@@ -3,6 +3,7 @@ import { AgentCompletionRequest } from "../types/agent_types/agent_request";
 import { AgentError, createAgentError } from "../types/agent_types/agent_error";
 import { LlmCallAdapter } from "../driver/llm/llmCallDriver";
 import { GeminiKeysPool } from "../providers/gemini/geminiProvider";
+import { opencodeIdentity } from "../providers/opencode/opencodeIdentity";
 import type { GeminiModelId } from "../providers/gemini/geminiProviderConfig";
 
 const adapter = new LlmCallAdapter();
@@ -24,7 +25,9 @@ export const agent_completion: RequestHandler = async (
   res: Response,
   next: NextFunction,
 ) => {
+  console.log("=======SERVER HIT=======")
   const parsed = AgentCompletionRequest.safeParse(req.body);
+  console.log(`model used in req body: ${parsed.data?.model}`)
 
   if (!parsed.success) {
     const error = createAgentError(
@@ -42,11 +45,13 @@ export const agent_completion: RequestHandler = async (
   const geminiSession = await geminiPool.reserveAsync(geminiModel, {
     timeoutMs: 500,
   });
+  console.log(`model goten from the pool (final): ${geminiSession?.modelId}`)
 
   try {
-    const result = await adapter.callWithFallback(parsed.data, geminiSession);
+    const result = await adapter.callWithFallback(parsed.data, geminiSession, opencodeIdentity.get().session);
     res.json(result);
   } catch (err: any) {
+    console.log("error")
     // thrown AgentError from adapter
     if (err instanceof AgentError) {
       const { error } = err;
