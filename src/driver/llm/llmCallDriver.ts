@@ -8,9 +8,10 @@ import {
   createAgentError,
 } from "../../types/agent_types/agent_error";
 import { ReservedGeminiKey } from "../../providers/gemini/geminiProviderConfig";
+import { deepseekConfig, resolveDeepseekModel } from "../../providers/deepseek/deepseekConfig";
 
 // ponytail: quota = 429 / RESOURCE_EXHAUSTED saja, sinyal lain tetap provider_error
-function isQuotaError(status: number, errorBody: any, message: string): boolean {
+export function isQuotaError(status: number, errorBody: any, message: string): boolean {
   if (status === 429) return true;
   const code = errorBody?.code;
   const s = String(errorBody?.status ?? code ?? "");
@@ -153,6 +154,7 @@ export class LlmCallAdapter {
     const startTime = performance.now();
 
     try {
+      console.log(`[llm] serving via gemini model=${session.modelId}`);
       const res = await fetch(
         // this url is a special url for openai scheme to work in gemini
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -203,7 +205,9 @@ export class LlmCallAdapter {
       if (typeof data?.usage?.total_tokens === "number") {
         try {
           session.recordUsage(data.usage.total_tokens);
-        } catch {}
+        } catch {
+          console.warn("cannot record the token usage of gemini")
+        }
       }
       // Release the reserved key back to the pool.
       session.release();
@@ -249,22 +253,128 @@ export class LlmCallAdapter {
     }
   }
 
+  async callDeepseekAdapter(
+    request: AgentCompletionRequestType,
+    modelId?: string,
+  ): Promise<AgentCompletionResponse> {
+    if (!deepseekConfig.apiKey) {
+      throw createAgentError(
+        "DeepSeek API key is missing (DEEPSEEK_API_KEY)",
+        "invalid_request_error",
+        null,
+        "missing_deepseek_key",
+      );
+    }
+
+    const {
+      fallback: _fallback,
+      frequency_penalty: _fp,
+      presence_penalty: _pp,
+      seed: _s,
+      logprobs: _l,
+      ...cleanRequest
+    } = request as any;
+
+    const resolvedModel = resolveDeepseekModel(modelId ?? request.model);
+    const payload = {
+      ...cleanRequest,
+      model: resolvedModel,
+      stream: false,
+      ...(request.n && request.n > 1 ? { n: 1 } : {}),
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      opencodeConfig.requestTimeout,
+    );
+    const startTime = performance.now();
+
+    try {
+      console.log(`[llm] serving via deepseek model=${resolvedModel}`);
+      const res = await fetch(deepseekConfig.baseUrl, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${deepseekConfig.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const raw = await res.json().catch(() => null);
+        let message = `Upstream request failed with status ${res.status} ${res.statusText}`;
+        let code: string | null = "provider_error";
+        let details: unknown;
+
+        const errorBody: any = (raw as any)?.error;
+        if (errorBody) {
+          message = errorBody.message ?? message;
+          code = String(errorBody.code ?? errorBody.type ?? code);
+          details = raw;
+        } else if (raw) {
+          details = raw;
+        }
+
+        // ponytail: reuse isQuotaError (terverifikasi 24/24 lawan 429 asli)
+        if (isQuotaError(res.status, errorBody, message)) {
+          throw createAgentError(message, "upstream_error", null, "quota_exhausted", details);
+        }
+        throw createAgentError(message, "upstream_error", null, code, details);
+      }
+
+      const data = await res.json();
+      const parsed = AgentCompletionResponse.safeParse(data);
+      if (!parsed.success) {
+        throw createAgentError(
+          "Invalid upstream response structure.",
+          "upstream_error",
+          null,
+          "invalid_upstream_response",
+          { issues: parsed.error.issues },
+        );
+      }
+
+      return parsed.data;
+    } catch (err: any) {
+      if (err instanceof AgentError) throw err;
+
+      const latencyMs = performance.now() - startTime;
+      if (err instanceof Error && err.name === "AbortError") {
+        throw createAgentError(
+          `Upstream request timed out after ${opencodeConfig.requestTimeout}ms`,
+          "upstream_error",
+          null,
+          "provider_timeout",
+          { latencyMs },
+        );
+      }
+      throw createAgentError(
+        err instanceof Error ? err.message : "Unknown upstream error",
+        "upstream_error",
+        null,
+        "provider_error",
+        { latencyMs },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async callWithFallback(
     request: AgentCompletionRequestType,
     geminiSession: ReservedGeminiKey | null | undefined,
-    opencodeSessionId?: string,
+    _opencodeSessionId?: string,
   ): Promise<AgentCompletionResponse> {
-    // ponytail: hanya quota yang fallback ke opencode, error lain rethrow
+    // ponytail: error gemini apa pun -> deepseek, tanpa opencode
     if (!geminiSession) {
-      return this.opencodeCallAdapter(request.model, request, opencodeSessionId);
+      return this.callDeepseekAdapter(request);
     }
     try {
       return await this.callGeminiAdapter(request, geminiSession);
-    } catch (err: any) {
-      if (err instanceof AgentError && err.error.code === "quota_exhausted") {
-        return this.opencodeCallAdapter(request.model, request, opencodeSessionId);
-      }
-      throw err;
+    } catch {
+      return this.callDeepseekAdapter(request);
     }
   }
 }

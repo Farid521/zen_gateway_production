@@ -40,12 +40,12 @@ export const agent_completion: RequestHandler = async (
     return;
   }
 
-  // ponytail: reserveAsync 500ms — cukup tunggu key free sebentar, lalu fallback ke opencode via callWithFallback (cegah hang)
+  // ponytail: reserveAsync 500ms — cukup tunggu key free sebentar, lalu fallback ke deepseek via callWithFallback (cegah hang)
   const geminiModel = resolveGeminiModel(parsed.data.model);
   const geminiSession = await geminiPool.reserveAsync(geminiModel, {
     timeoutMs: 500,
   });
-  console.log(`model goten from the pool (final): ${geminiSession?.modelId}`)
+  console.log(`model got from the pool (final): ${geminiSession?.modelId}`)
 
   try {
     const result = await adapter.callWithFallback(parsed.data, geminiSession, opencodeIdentity.get().session);
