@@ -12,7 +12,7 @@ export const deepseekConfig = {
   defaultModel: "deepseek-v4-flash",
 };
 
-// ponytail: id DeepSeek valid -> pakai, selain itu -> default flash
-export function resolveDeepseekModel(m?: string): string {
-  return m && DEEPSEEK_IDS.has(m) ? m : deepseekConfig.defaultModel;
+// ponytail: kunci flash, abaikan pro dari request
+export function resolveDeepseekModel(_m?: string): string {
+  return "deepseek-v4-flash";
 }

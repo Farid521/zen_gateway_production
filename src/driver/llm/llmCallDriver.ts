@@ -279,6 +279,9 @@ export class LlmCallAdapter {
     const payload = {
       ...cleanRequest,
       model: resolvedModel,
+      // ponytail: thinking on (high) — reasoning di reasoning_content
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
       stream: false,
       ...(request.n && request.n > 1 ? { n: 1 } : {}),
     };
@@ -368,13 +371,25 @@ export class LlmCallAdapter {
     _opencodeSessionId?: string,
   ): Promise<AgentCompletionResponse> {
     // ponytail: error gemini apa pun -> deepseek, tanpa opencode
+    const OK = "\x1b[32m[LLM:OK]\x1b[0m";
+    const FAIL = "\x1b[33m[LLM:FALLBACK]\x1b[0m";
     if (!geminiSession) {
-      return this.callDeepseekAdapter(request);
+      const t0 = performance.now();
+      const r = await this.callDeepseekAdapter(request);
+      console.log(`${OK} provider=deepseek model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
+      return r;
     }
     try {
-      return await this.callGeminiAdapter(request, geminiSession);
-    } catch {
-      return this.callDeepseekAdapter(request);
+      const t0 = performance.now();
+      const r = await this.callGeminiAdapter(request, geminiSession);
+      console.log(`${OK} provider=gemini model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
+      return r;
+    } catch (e: any) {
+      console.log(`${FAIL} gemini=${geminiSession.modelId} err=${e?.message} -> deepseek`);
+      const t0 = performance.now();
+      const r = await this.callDeepseekAdapter(request);
+      console.log(`${OK} provider=deepseek model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
+      return r;
     }
   }
 }
