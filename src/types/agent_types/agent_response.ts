@@ -36,16 +36,19 @@ export const AssistantMessageSchema = z.object({
 }).passthrough();
 export type AssistantMessage = z.infer<typeof AssistantMessageSchema>;
 
-export const FinishReasonSchema = z.enum([
-  "stop",
-  "length",
-  "tool_calls",
-  "content_filter",
-  "function_call",
-  "insufficient_system_resource",
-  "null",
-  "error",
-]);
+export const FinishReasonSchema = z.union([
+  z.enum([
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "function_call",
+    "insufficient_system_resource",
+    "null",
+    "error",
+  ]),
+  z.string(),
+]).transform((v) => (typeof v === "string" && v.startsWith("function_call_filter") ? "error" : v));
 export type FinishReason = z.infer<typeof FinishReasonSchema>;
 
 export const ChoiceSchema = z.object({
