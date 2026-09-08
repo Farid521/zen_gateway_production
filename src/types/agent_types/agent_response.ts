@@ -7,7 +7,7 @@ export const ToolCallSchema = z.object({
     name: z.string(),
     arguments: z.string(),
   }),
-});
+}).passthrough();
 export type ToolCall = z.infer<typeof ToolCallSchema>;
 
 const ResponseTextContentPartSchema = z.object({
@@ -33,7 +33,7 @@ export const AssistantMessageSchema = z.object({
   content: ResponseContentSchema.nullish(),
   tool_calls: z.array(ToolCallSchema).nullish(),
   reasoning_content: z.string().nullable().optional(),
-});
+}).passthrough();
 export type AssistantMessage = z.infer<typeof AssistantMessageSchema>;
 
 export const FinishReasonSchema = z.enum([
@@ -53,7 +53,7 @@ export const ChoiceSchema = z.object({
   message: AssistantMessageSchema,
   finish_reason: FinishReasonSchema.nullable(),
   logprobs: z.null().default(null),
-});
+}).passthrough();
 export type Choice = z.infer<typeof ChoiceSchema>;
 
 export const UsageSchema = z.object({
@@ -62,7 +62,7 @@ export const UsageSchema = z.object({
   total_tokens: z.number().int().nonnegative(),
   cached_content_token_count: z.number().int().nonnegative().optional(),
   thoughts_token_count: z.number().int().nonnegative().optional(),
-});
+}).passthrough();
 export type Usage = z.infer<typeof UsageSchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ export const AgentCompletionResponse = z.object({
   choices: z.array(ChoiceSchema).min(1),
   usage: UsageSchema.optional(),
   system_fingerprint: z.string().optional(),
-});
+}).passthrough();
 export type AgentCompletionResponse = z.infer<typeof AgentCompletionResponse>;
 
 export const DeltaSchema = z.object({

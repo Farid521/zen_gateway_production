@@ -228,12 +228,14 @@ export class LlmCallAdapter {
 
       const parsed = AgentCompletionResponse.safeParse(data);
       if (!parsed.success) {
+        // ponytail: log detail agar invalid_upstream_response mudah di-debug di Render
+        console.error(`[ERROR][Gemini] invalid_upstream_response issues=${JSON.stringify(parsed.error.issues).slice(0,800)} raw=${JSON.stringify(data).slice(0,1000)}`);
         throw createAgentError(
           "Invalid upstream response structure.",
           "upstream_error",
           null,
           "invalid_upstream_response",
-          { issues: parsed.error.issues },
+          { issues: parsed.error.issues, raw: JSON.stringify(data).slice(0,2000) },
         );
       }
 
@@ -344,12 +346,13 @@ export class LlmCallAdapter {
       const data = await res.json();
       const parsed = AgentCompletionResponse.safeParse(data);
       if (!parsed.success) {
+        console.error(`[ERROR][DeepSeek] invalid_upstream_response issues=${JSON.stringify(parsed.error.issues).slice(0,800)} raw=${JSON.stringify(data).slice(0,1000)}`);
         throw createAgentError(
           "Invalid upstream response structure.",
           "upstream_error",
           null,
           "invalid_upstream_response",
-          { issues: parsed.error.issues },
+          { issues: parsed.error.issues, raw: JSON.stringify(data).slice(0,2000) },
         );
       }
 
