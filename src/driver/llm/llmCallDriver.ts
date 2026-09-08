@@ -140,11 +140,25 @@ export class LlmCallAdapter {
       ...cleanRequest
     } = request as any;
 
-    const payload = {
+    const payload: any = {
       ...cleanRequest,
       model: session.modelId,
       ...(request.n && request.n > 1 ? { n: 1 } : {}),
     };
+
+    // ponytail: inject dummy thought_signature untuk histori synthetic/transfer (Gemini 3 wajib)
+    if (Array.isArray(payload.tools) && payload.tools.length > 0 && Array.isArray(payload.messages)) {
+      payload.messages = payload.messages.map((m: any) => {
+        if (m.role !== "assistant" || !Array.isArray(m.tool_calls)) return m;
+        return {
+          ...m,
+          tool_calls: m.tool_calls.map((tc: any) => {
+            if (tc?.extra_content?.google?.thought_signature) return tc;
+            return { ...tc, extra_content: { ...(tc.extra_content || {}), google: { ...(tc.extra_content?.google || {}), thought_signature: "skip_thought_signature_validator" } } };
+          }),
+        };
+      });
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(
@@ -276,12 +290,12 @@ export class LlmCallAdapter {
     } = request as any;
 
     const resolvedModel = resolveDeepseekModel(modelId ?? request.model);
+    // ponytail: thinking off saat tools ada — cegah 400 reasoning_content must be passed back + hemat token
+    const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
     const payload = {
       ...cleanRequest,
       model: resolvedModel,
-      // ponytail: thinking on (high) — reasoning di reasoning_content
-      thinking: { type: "enabled" },
-      reasoning_effort: "high",
+      ...(hasTools ? { thinking: { type: "disabled" } } : { thinking: { type: "enabled" }, reasoning_effort: "high" }),
       stream: false,
       ...(request.n && request.n > 1 ? { n: 1 } : {}),
     };
@@ -385,6 +399,11 @@ export class LlmCallAdapter {
       console.log(`${OK} provider=gemini model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
       return r;
     } catch (e: any) {
+      // ponytail: hanya fallback untuk quota/timeout, 400 validasi (thought_signature etc) langsung throw
+      const code = e?.error?.code;
+      const isQuota = code === "quota_exhausted";
+      const isTimeout = code === "provider_timeout";
+      if (!isQuota && !isTimeout) throw e;
       console.log(`${FAIL} gemini=${geminiSession.modelId} err=${e?.message} -> deepseek`);
       const t0 = performance.now();
       const r = await this.callDeepseekAdapter(request);

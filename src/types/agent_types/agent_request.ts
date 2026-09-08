@@ -38,7 +38,7 @@ const ToolCallSchema = z.object({
     name: z.string(),
     arguments: z.string(),
   }),
-});
+}).passthrough();
 
 // ------------------------------------------------------------
 // Messages
@@ -61,7 +61,8 @@ const ChatMessageSchema = z.object({
   function_call: z
     .object({ name: z.string(), arguments: z.string() })
     .optional(),
-});
+  reasoning_content: z.string().nullable().optional(),
+}).passthrough();
 
 // ------------------------------------------------------------
 // Tool definitions
