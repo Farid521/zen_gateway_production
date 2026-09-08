@@ -1,0 +1,2768 @@
+Project      : zen_gateway_production
+Generated    : 2026-09-03
+Total Files  : 22
+===============================================================================
+File Name     : server.ts
+Relative Path : src/server.ts
+===============================================================================
+import express from "express";
+import { agent_completion } from "./routes/agent_completion";
+import { OpencodeProvider } from "./providers/opencode/opencodeProvider";
+import { GeminiKeysPool } from "./providers/gemini/geminiProvider";
+
+const app = express();
+app.use(express.json({limit: "10mb"}));
+
+OpencodeProvider.getInstance();
+GeminiKeysPool.getInstance();
+
+app.post("/v1/chat/completions", agent_completion);
+
+app.listen(3000, () => {
+  console.log("Server running on http://localhost:3000");
+});
+===============================================================================
+File Name     : agent_completion.ts
+Relative Path : src/routes/agent_completion.ts
+===============================================================================
+import { Request, Response, NextFunction, RequestHandler } from "express";
+import { AgentCompletionRequest } from "../types/agent_types/agent_request";
+import { AgentError, createAgentError } from "../types/agent_types/agent_error";
+import { LlmCallAdapter } from "../driver/llm/llmCallDriver";
+import { GeminiKeysPool } from "../providers/gemini/geminiProvider";
+import type { GeminiModelId } from "../providers/gemini/geminiProviderConfig";
+
+const adapter = new LlmCallAdapter();
+const geminiPool = GeminiKeysPool.getInstance();
+
+// ponytail: opsi A — map request.model -> Gemini id, default 3.1-flash-lite
+const GEMINI_IDS = new Set<GeminiModelId>([
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash-lite",
+]);
+function resolveGeminiModel(m: string): GeminiModelId {
+  return GEMINI_IDS.has(m as GeminiModelId)
+    ? (m as GeminiModelId)
+    : "gemini-3.1-flash-lite";
+}
+
+export const agent_completion: RequestHandler = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const parsed = AgentCompletionRequest.safeParse(req.body);
+
+  if (!parsed.success) {
+    const error = createAgentError(
+      `Invalid request: ${parsed.error.issues
+        .map((i) => `${i.path.join(".") || "root"}: ${i.message}`)
+        .join("; ")}`,
+      "invalid_request_error",
+    );
+    res.status(400).json(error.toResponse());
+    return;
+  }
+
+  // ponytail: reserveAsync 500ms — cukup tunggu key free sebentar, lalu fallback ke opencode via callWithFallback (cegah hang)
+  const geminiModel = resolveGeminiModel(parsed.data.model);
+  const geminiSession = await geminiPool.reserveAsync(geminiModel, {
+    timeoutMs: 500,
+  });
+
+  try {
+    const result = await adapter.callWithFallback(parsed.data, geminiSession);
+    res.json(result);
+  } catch (err: any) {
+    // thrown AgentError from adapter
+    if (err instanceof AgentError) {
+      const { error } = err;
+      if (error.type === "service_unavailable" || error.code === "no_model_available") {
+        res.status(503).json(err.toResponse());
+        return;
+      }
+      if (error.type === "invalid_request_error") {
+        res.status(400).json(err.toResponse());
+        return;
+      }
+      res.status(502).json(err.toResponse());
+      return;
+    }
+    next(err);
+  }
+};
+===============================================================================
+File Name     : llmCallDriver.ts
+Relative Path : src/driver/llm/llmCallDriver.ts
+===============================================================================
+import { opencodeConfig } from "../../providers/opencode/opencodeConfig";
+import { opencodeIdentity } from "../../providers/opencode/opencodeIdentity";
+import { AgentCompletionRequestType } from "../../types/agent_types/agent_request";
+import { AgentCompletionResponse } from "../../types/agent_types/agent_response";
+import {
+  AgentError,
+  AgentErrorResponseSchema,
+  createAgentError,
+} from "../../types/agent_types/agent_error";
+import { ReservedGeminiKey } from "../../providers/gemini/geminiProviderConfig";
+import { OpencodeProvider } from "../../providers/opencode/opencodeProvider";
+
+export class LlmCallAdapter {
+  constructor() {}
+
+  async opencodeCallAdapter(
+    model: string,
+    request: AgentCompletionRequestType,
+    sessionId?: string,
+  ): Promise<AgentCompletionResponse> {
+    const { fallback: _fallback, ...rest } = request;
+
+    const body = JSON.stringify({
+      ...rest,
+      model,
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      opencodeConfig.requestTimeout,
+    );
+
+    const startTime = performance.now();
+
+    try {
+      const identity = opencodeIdentity.get();
+      const res = await fetch(opencodeConfig.opencodeBaseUrl.chatCompletion, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${opencodeConfig.apiKey}`,
+          "Content-Type": "application/json",
+          "User-Agent": "opencode/1.16.0",
+          "x-opencode-client": "cli",
+          "x-opencode-project": "global",
+          "x-opencode-session": sessionId || identity.session,
+          "x-opencode-request": identity.request,
+        },
+        body,
+      });
+
+      if (!res.ok) {
+        const raw = await res.text();
+        let message = `Upstream request failed with status ${res.status} ${res.statusText}`;
+        let code = "provider_error";
+        let details: unknown;
+
+        try {
+          const parsed = AgentErrorResponseSchema.safeParse(JSON.parse(raw));
+          if (parsed.success) {
+            message = parsed.data.error.message;
+            code = parsed.data.error.code ?? code;
+            details = parsed.data.error.details;
+          }
+        } catch {
+          // ignore JSON parse failure; fallback to generic message
+        }
+
+        throw createAgentError(message, "upstream_error", null, code, details);
+      }
+
+      const data = await res.json();
+      const parsed = AgentCompletionResponse.safeParse(data);
+
+      if (!parsed.success) {
+        throw createAgentError(
+          "Invalid upstream response structure.",
+          "upstream_error",
+          null,
+          "invalid_upstream_response",
+          { issues: parsed.error.issues },
+        );
+      }
+
+      return parsed.data;
+    } catch (err: any) {
+      if (err instanceof AgentError) throw err;
+
+      const latencyMs = performance.now() - startTime;
+      if (err instanceof Error && err.name === "AbortError") {
+        throw createAgentError(
+          `Upstream request timed out after ${opencodeConfig.requestTimeout}ms`,
+          "upstream_error",
+          null,
+          "provider_timeout",
+          { latencyMs },
+        );
+      }
+      throw createAgentError(
+        err instanceof Error ? err.message : "Unknown upstream error",
+        "upstream_error",
+        null,
+        "provider_error",
+        { latencyMs },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async callGeminiAdapter(
+    request: AgentCompletionRequestType,
+    session: ReservedGeminiKey | null | undefined,
+  ): Promise<AgentCompletionResponse> {
+    if (!session) {
+      throw createAgentError(
+        "Gemini session is required but was null or undefined",
+        "invalid_request_error",
+        null,
+        "missing_gemini_session",
+      );
+    }
+
+    const {
+      fallback: _fallback,
+      frequency_penalty: _fp,
+      presence_penalty: _pp,
+      seed: _s,
+      logprobs: _l,
+      ...cleanRequest
+    } = request as any;
+
+    const payload = {
+      ...cleanRequest,
+      model: session.modelId,
+      ...(request.n && request.n > 1 ? { n: 1 } : {}),
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opencodeConfig.requestTimeout);
+    const startTime = performance.now();
+
+    try {
+      const res = await fetch(
+        // this url is a special url for openai scheme to work in gemini
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${session.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+
+      if (!res.ok) {
+        // Parse upstream error payload, gracefully falling back on invalid JSON.
+        const raw = await res.json().catch(() => null);
+        let message = `Upstream request failed with status ${res.status} ${res.statusText}`;
+        let code: string | null = "provider_error";
+        let details: unknown;
+
+        // Extract error details, normalizing Gemini's array-wrapped error format and OpenAI's object format.
+        // Example raw[0] from Gemini: [{ error: { code: 400, message: "Invalid JSON payload...", status: "INVALID_ARGUMENT", details: [...] } }]
+        const errorBody: any = Array.isArray(raw) ? raw[0]?.error : (raw as any)?.error;
+        if (errorBody) {
+          message = errorBody.message ?? message;
+          code = errorBody.code ?? code;
+          details = errorBody.details ?? raw;
+        } else if (raw) {
+          details = raw;
+        }
+
+        session.release();
+        throw createAgentError(message, "upstream_error", null, code, details);
+      }
+
+      // Parse upstream success payload.
+      const data = await res.json();
+
+      // Record token usage if present, ignoring tracking failures.
+      // Validate response against schema (Expected shape: { choices: [{ message: { content, tool_calls }, finish_reason }], usage: { total_tokens } })
+      if (typeof data?.usage?.total_tokens === "number") {
+        try {
+          session.recordUsage(data.usage.total_tokens);
+        } catch {}
+      }
+      // Release the reserved key back to the pool.
+      session.release();
+
+      const parsed = AgentCompletionResponse.safeParse(data);
+      if (!parsed.success) {
+        throw createAgentError(
+          "Invalid upstream response structure.",
+          "upstream_error",
+          null,
+          "invalid_upstream_response",
+          { issues: parsed.error.issues },
+        );
+      }
+
+      return parsed.data;
+    } catch (err: any) {
+      if (err instanceof AgentError) throw err;
+
+      const latencyMs = performance.now() - startTime;
+      try {
+        session.release();
+      } catch {}
+
+      if (err instanceof Error && err.name === "AbortError") {
+        throw createAgentError(
+          `Upstream request timed out after ${opencodeConfig.requestTimeout}ms`,
+          "upstream_error",
+          null,
+          "provider_timeout",
+          { latencyMs },
+        );
+      }
+      throw createAgentError(
+        err instanceof Error ? err.message : "Unknown upstream error",
+        "upstream_error",
+        null,
+        "provider_error",
+        { latencyMs },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async callWithFallback(
+    request: AgentCompletionRequestType,
+    geminiSession: ReservedGeminiKey | null | undefined,
+    opencodeSessionId?: string,
+  ): Promise<AgentCompletionResponse> {
+    let lastError: any = null;
+
+    // 1. Gemini — jika session null/undefined langsung ke opencode
+    if (geminiSession) {
+      try {
+        return await this.callGeminiAdapter(request, geminiSession);
+      } catch (err: any) {
+        lastError = err;
+      }
+    } else {
+      lastError = createAgentError(
+        "Gemini session is required but was null or undefined",
+        "invalid_request_error",
+        null,
+        "missing_gemini_session",
+      );
+    }
+
+    // 2. Opencode — gunakan getBestModel() internal (fallback selalu)
+    // ponytail: jika gemini null karena pool habis, jangan throw 400 missing_gemini_session - fallback ke opencode dulu, hanya 503 jika opencode juga null
+    const bestModel = OpencodeProvider.getBestModel();
+    if (!bestModel) {
+      if (lastError && lastError?.error?.code !== "missing_gemini_session") throw lastError;
+      throw createAgentError(
+        "No available model found. Please try again later.",
+        "service_unavailable",
+        null,
+        "no_model_available",
+      );
+    }
+
+    try {
+      return await this.opencodeCallAdapter(bestModel.model, request, opencodeSessionId);
+    } catch (err: any) {
+      throw err;
+    }
+  }
+}
+===============================================================================
+File Name     : llmCallDriverConfig.ts
+Relative Path : src/driver/llm/llmCallDriverConfig.ts
+===============================================================================
+export interface LlmCallRequest {
+  prompt: string;
+}
+
+export interface LlmCallResult {
+  content: string;
+  totalTokens: number;
+}
+===============================================================================
+File Name     : tavilyDriver.ts
+Relative Path : src/driver/llm/tavily/tavilyDriver.ts
+===============================================================================
+import { z } from "zod";
+import { TAVILY_API_BASE_URL } from "../../../providers/tavily/tavilyConfig";
+import type { TavilyApiKeySession } from "../../../providers/tavily/tavilyConfig";
+import type {
+  TavilySearchRequest,
+  TavilySearchResponse,
+} from "../../../types/tavily/search";
+import { TavilySearchResponseSchema } from "../../../types/tavily/search";
+import type {
+  TavilyCrawlRequest,
+  TavilyCrawlResponse,
+} from "../../../types/tavily/crawl";
+import { TavilyCrawlResponseSchema } from "../../../types/tavily/crawl";
+import type {
+  TavilyExtractRequest,
+  TavilyExtractResponse,
+} from "../../../types/tavily/extract";
+import { TavilyExtractResponseSchema } from "../../../types/tavily/extract";
+import { createTavilyError } from "../../../types/tavily/error";
+import type { TavilyEndpoint } from "../../../types/tavily/error";
+
+/**
+ * TavilyProvider acts as a client driver for the Tavily API,
+ * providing methods to interact with search, extract, and crawl endpoints.
+ */
+export class TavilyProvider {
+  constructor() {}
+
+  /**
+   * Private generic helper to execute any Tavily API request with unified
+   * error handling, timeout control, and Zod response validation.
+   */
+  private static async request<TResponse>(
+    session: TavilyApiKeySession,
+    endpoint: TavilyEndpoint,
+    body: unknown,
+    schema: z.ZodSchema<TResponse>,
+    options: {
+      timeoutMs?: number;
+      emptyCheck?: (data: TResponse) => boolean;
+      emptyMessage?: string;
+    } = {},
+  ): Promise<TResponse> {
+    // Ensure we have a valid API key before proceeding
+    if (!session.apiKey) {
+      throw createTavilyError(
+        401,
+        "no API key available, all keys exhausted",
+        endpoint,
+      );
+    }
+
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(`${TAVILY_API_BASE_URL}/${endpoint}`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${session.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      // Handle non-OK HTTP responses
+      if (!res.ok) {
+        const raw = await res.text().catch(() => "unknown error");
+        throw createTavilyError(res.status, raw, endpoint);
+      }
+
+      // Parse and validate the response against the schema
+      const data = await res.json();
+      const parsed = schema.safeParse(data);
+
+      if (!parsed.success) {
+        throw createTavilyError(
+          200,
+          `invalid response schema: ${parsed.error.issues.map((i) => i.message).join(", ")}`,
+          endpoint,
+        );
+      }
+
+      // Ensure at least one result is returned (if check provided)
+      if (options.emptyCheck && options.emptyCheck(parsed.data)) {
+        throw createTavilyError(
+          200,
+          options.emptyMessage ?? "no results found",
+          endpoint,
+        );
+      }
+
+      return parsed.data;
+    } catch (err) {
+      // Re-throw if already a TavilyError
+      if (err && typeof err === "object" && "code" in err) {
+        throw err;
+      }
+
+      // Handle abort (timeout) errors
+      if (err instanceof Error && err.name === "AbortError") {
+        throw createTavilyError(
+          504,
+          `request timed out after ${timeoutMs}ms`,
+          endpoint,
+        );
+      }
+
+      // Handle general errors
+      throw createTavilyError(
+        500,
+        err instanceof Error ? err.message : "unknown error",
+        endpoint,
+      );
+    } finally {
+      // Always clear the timer to avoid resource leaks
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Executes a search query using the Tavily API.
+   *
+   * @param session - The API key session containing a valid key for authorization.
+   * @param message - The search request parameters.
+   * @returns A promise resolving to the full search response.
+   * @throws TavilyError if the request fails, times out, or returns no results.
+   */
+  public async search(
+    session: TavilyApiKeySession,
+    message: TavilySearchRequest,
+  ): Promise<TavilySearchResponse> {
+    return TavilyProvider.request<TavilySearchResponse>(
+      session,
+      "search",
+      message,
+      TavilySearchResponseSchema,
+      {
+        timeoutMs: 30_000,
+        emptyCheck: (data) => data.results.length === 0,
+        emptyMessage: "no search results found",
+      },
+    );
+  }
+
+  /**
+   * Executes a website crawl using the Tavily API.
+   *
+   * @param session - The API key session containing a valid key for authorization.
+   * @param message - The crawl request parameters.
+   * @returns A promise resolving to the full crawl response.
+   * @throws TavilyError if the request fails, times out, or returns no results.
+   */
+  public async crawl(
+    session: TavilyApiKeySession,
+    message: TavilyCrawlRequest,
+  ): Promise<TavilyCrawlResponse> {
+    const timeoutMs = message.timeout ? message.timeout * 1000 : 30_000;
+    return TavilyProvider.request<TavilyCrawlResponse>(
+      session,
+      "crawl",
+      message,
+      TavilyCrawlResponseSchema,
+      {
+        timeoutMs,
+        emptyCheck: (data) => data.results.length === 0,
+        emptyMessage: "no crawl results found",
+      },
+    );
+  }
+
+  /**
+   * Extracts content from one or more URLs using the Tavily API.
+   *
+   * @param session - The API key session containing a valid key for authorization.
+   * @param message - The extract request parameters.
+   * @returns A promise resolving to the full extract response.
+   * @throws TavilyError if the request fails, times out, or returns no results.
+   */
+  public async extract(
+    session: TavilyApiKeySession,
+    message: TavilyExtractRequest,
+  ): Promise<TavilyExtractResponse> {
+    const timeoutMs = message.timeout ? message.timeout * 1000 : 30_000;
+    return TavilyProvider.request<TavilyExtractResponse>(
+      session,
+      "extract",
+      message,
+      TavilyExtractResponseSchema,
+      {
+        timeoutMs,
+        emptyCheck: (data) =>
+          data.results.length === 0 && data.failed_results.length === 0,
+        emptyMessage: "no extract results found",
+      },
+    );
+  }
+}
+
+export default TavilyProvider;
+===============================================================================
+File Name     : geminiProvider.ts
+Relative Path : src/providers/gemini/geminiProvider.ts
+===============================================================================
+import {
+  createGeminiConfig,
+  GeminiConfig,
+  GeminiKey,
+  GeminiModel,
+  GeminiModelConfig,
+  GeminiModelId,
+  GeminiModelState,
+  ReservedGeminiKey,
+  ReserveWaitOptions,
+} from "./geminiProviderConfig";
+
+// Sliding window for RPM/TPM checks.
+const WINDOW_MS = 60_000;
+// Daily window for RPD checks.
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export class GeminiKeysPool {
+  private static instance: GeminiKeysPool | null = null;
+  private static seq = 0;
+
+  private readonly geminiKeys: GeminiKey[];
+  private nextKeyIndex = 0;
+
+  /**
+   * Creates per-key model states from the given config.
+   */
+  private static createGeminiKeys(config: GeminiConfig): GeminiKey[] {
+    const now = Date.now();
+    return config.keys.map((apiKey, index) => {
+      const models = {} as Record<GeminiModelId, GeminiModel>;
+      for (const [modelId, modelConfig] of Object.entries(config.models) as [
+        GeminiModelId,
+        GeminiModelConfig,
+      ][]) {
+        models[modelId] = {
+          id: modelId,
+          rpm: modelConfig.rpm,
+          tpm: modelConfig.tpm,
+          rpd: modelConfig.rpd,
+          state: {
+            reservationId: null,
+            requestTimestamps: [],
+            tokenUsages: [],
+            dailyRequestCount: 0,
+            dailyResetAt: now + DAY_MS,
+          },
+        };
+      }
+      return { id: `gemini-key-${index + 1}`, apiKey, models };
+    });
+  }
+
+  private constructor(config: GeminiConfig = createGeminiConfig()) {
+    this.geminiKeys = GeminiKeysPool.createGeminiKeys(config);
+  }
+
+  /**
+   * Initializes the singleton with the given config.
+   *
+   * Throws when the pool has already been initialized.
+   */
+  static initialize(
+    config: GeminiConfig = createGeminiConfig(),
+  ): GeminiKeysPool {
+    if (GeminiKeysPool.instance !== null)
+      throw new Error("GeminiKeysPool has already been initialized.");
+    GeminiKeysPool.instance = new GeminiKeysPool(config);
+    return GeminiKeysPool.instance;
+  }
+
+  /**
+   * Returns the singleton instance, creating it from environment when not yet initialized.
+   */
+  static getInstance(): GeminiKeysPool {
+    if (GeminiKeysPool.instance === null)
+      GeminiKeysPool.instance = new GeminiKeysPool(createGeminiConfig());
+    return GeminiKeysPool.instance;
+  }
+
+  /**
+   * Resets the singleton. Test helper only.
+   */
+  static _resetForTest(): void {
+    GeminiKeysPool.instance = null;
+  }
+
+  /**
+   * Removes entries outside the current sliding window.
+   */
+  private cleanupSlidingWindow(state: GeminiModelState, now: number): void {
+    const windowStart = now - WINDOW_MS;
+    state.requestTimestamps = state.requestTimestamps.filter(
+      (t) => t > windowStart,
+    );
+    state.tokenUsages = state.tokenUsages.filter(
+      (u) => u.timestamp > windowStart,
+    );
+  }
+
+  /**
+   * Resets the daily request count when the daily window has elapsed.
+   */
+  private resetDailyCountIfNeeded(state: GeminiModelState, now: number): void {
+    if (now < state.dailyResetAt) return;
+    state.dailyRequestCount = 0;
+    state.dailyResetAt = now + DAY_MS;
+  }
+
+  /**
+   * Reserves an available key for the given model.
+   *
+   * Checks RPM, TPM, and RPD limits within the sliding and daily windows.
+   * Uses round-robin across keys and skips keys that are currently reserved.
+   * Returns null when no key is available.
+   */
+  reserve(modelId: GeminiModelId): ReservedGeminiKey | null {
+    const now = Date.now();
+    const totalKeys = this.geminiKeys.length;
+    if (totalKeys === 0) return null;
+
+    for (let offset = 0; offset < totalKeys; offset++) {
+      const index = (this.nextKeyIndex + offset) % totalKeys;
+      const key = this.geminiKeys[index];
+      const model = key.models[modelId];
+      if (!model) continue;
+
+      const state = model.state;
+      // Remove expired entries before checking limits.
+      this.cleanupSlidingWindow(state, now);
+      this.resetDailyCountIfNeeded(state, now);
+
+      // Skip keys that are reserved or have exceeded quota.
+      if (state.reservationId !== null) continue;
+      if (state.requestTimestamps.length >= model.rpm) continue;
+
+      const tokensInWindow = state.tokenUsages.reduce(
+        (total, u) => total + u.tokens,
+        0,
+      );
+      if (tokensInWindow >= model.tpm) continue;
+      if (state.dailyRequestCount >= model.rpd) continue;
+
+      const reservationId = `r-${++GeminiKeysPool.seq}-${Date.now()}`;
+      state.reservationId = reservationId;
+      this.nextKeyIndex = (index + 1) % totalKeys;
+      let released = false;
+
+      return {
+        reservationId,
+        keyId: key.id,
+        modelId,
+        apiKey: key.apiKey,
+        rpm: model.rpm,
+        tpm: model.tpm,
+        rpd: model.rpd,
+        recordUsage(tokens: number) {
+          // Prevent recording after release.
+          if (released) throw new Error("Cannot record usage after release.");
+          if (!Number.isFinite(tokens) || tokens < 0)
+            throw new Error(`Invalid token usage: ${tokens}`);
+          const ts = Date.now();
+          state.requestTimestamps.push(ts);
+          state.tokenUsages.push({ timestamp: ts, tokens });
+          state.dailyRequestCount++;
+        },
+        release() {
+          if (released) return;
+          released = true;
+          // Ensure only the owning reservation clears the state.
+          if (state.reservationId === reservationId) state.reservationId = null;
+        },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Reserves a key, waiting until one becomes available.
+   *
+   * Polls via reserve() with a short delay.
+   * Returns null when the timeout expires or the signal is aborted.
+   */
+  async reserveAsync(
+    modelId: GeminiModelId,
+    options: ReserveWaitOptions = {},
+  ): Promise<ReservedGeminiKey | null> {
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const deadline = Date.now() + timeoutMs;
+
+    while (true) {
+      if (options.signal?.aborted) return null;
+
+      const reserved = this.reserve(modelId);
+      if (reserved !== null) return reserved;
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return null;
+
+      const delay = Math.min(50, remaining);
+
+      await new Promise<void>((resolve) => {
+        const onAbort = () => {
+          clearTimeout(t);
+          resolve();
+        };
+
+        const t = setTimeout(() => {
+          options.signal?.removeEventListener("abort", onAbort); // cleanup sebelum resolve
+          resolve();
+        }, delay);
+
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+  }
+}
+===============================================================================
+File Name     : geminiProviderConfig.ts
+Relative Path : src/providers/gemini/geminiProviderConfig.ts
+===============================================================================
+import "dotenv/config";
+
+export type GeminiModelId = "gemini-3.1-flash-lite" | "gemini-3.5-flash-lite";
+
+export interface GeminiModelConfig {
+  rpm: number;
+  tpm: number;
+  rpd: number;
+}
+
+export interface GeminiConfig {
+  keys: string[];
+  models: Record<GeminiModelId, GeminiModelConfig>;
+}
+
+// ponytail: WINDOW_MS/DAY_MS moved to geminiPool.ts (only consumer), keep config pure
+
+/* =========================================================
+ * INTERNAL STATE
+ * ========================================================= */
+
+export interface GeminiModelState {
+  reservationId: string | null;
+  requestTimestamps: number[];
+  tokenUsages: { timestamp: number; tokens: number }[];
+  dailyRequestCount: number;
+  dailyResetAt: number;
+}
+
+export interface GeminiModel {
+  id: GeminiModelId;
+  rpm: number;
+  tpm: number;
+  rpd: number;
+  state: GeminiModelState;
+}
+
+export interface GeminiKey {
+  id: string;
+  apiKey: string;
+  models: Record<GeminiModelId, GeminiModel>;
+}
+
+/* =========================================================
+ * RESERVED KEY
+ * ========================================================= */
+
+export interface ReservedGeminiKey {
+  readonly reservationId: string;
+  readonly keyId: string;
+  readonly modelId: GeminiModelId;
+  readonly apiKey: string;
+  readonly rpm: number;
+  readonly tpm: number;
+  readonly rpd: number;
+  release(): void;
+  recordUsage(tokens: number): void;
+}
+
+export interface ReserveWaitOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export const DEFAULT_GEMINI_MODELS: Record<GeminiModelId, GeminiModelConfig> = {
+  "gemini-3.1-flash-lite": { rpm: 15, tpm: 100_000, rpd: 500 },
+  "gemini-3.5-flash-lite": { rpm: 10, tpm: 80_000, rpd: 300 },
+};
+
+// ponytail: only GEMINI_KEY + GEMINI_KEY_N (comma-separated), order by suffix, dedup via Set
+export function getGeminiKeysFromEnv(): string[] {
+  const entries = Object.entries(process.env)
+    .filter(([k, v]) => /^GEMINI_KEY(_\d+)?$/.test(k) && !!v?.trim())
+    .map(([k, v]) => ({
+      order: parseInt(k.match(/_(\d+)$/)?.[1] ?? "0", 10),
+      parts: v!
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+    }))
+    .sort((a, b) => a.order - b.order)
+    .flatMap((e) => e.parts);
+
+  return [...new Set(entries)];
+}
+
+export function createGeminiConfig(): GeminiConfig {
+  return { keys: getGeminiKeysFromEnv(), models: DEFAULT_GEMINI_MODELS };
+}
+===============================================================================
+File Name     : opencodeConfig.ts
+Relative Path : src/providers/opencode/opencodeConfig.ts
+===============================================================================
+interface OpencodeConfig {
+  apiKey: string;
+  opencodeBaseUrl: {
+    chatCompletion: string;
+    availableModels: string;
+  };
+  requestTimeout: number;
+  modelProbeInterval: number;
+  idRotationInterval: number;
+}
+
+export const opencodeConfig: OpencodeConfig = {
+  apiKey: "public",
+  opencodeBaseUrl: {
+    chatCompletion: "https://opencode.ai/zen/v1/chat/completions",
+    availableModels: "https://opencode.ai/zen/v1/models",
+  },
+  requestTimeout: 60 * 1000,
+  modelProbeInterval: 5 * 60 * 1000,
+  idRotationInterval: 15 * 60 * 1000,
+};
+
+// OpenAI message schemas.
+
+export type Role = "system" | "user" | "assistant" | "tool";
+
+export interface ChatMessage {
+  role: Role;
+  content: string | null;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
+}
+
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+export interface ChatCompletionRequest {
+  model: string;
+  messages: ChatMessage[];
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  stop?: string | string[];
+  stream?: boolean;
+  stream_options?: { include_usage?: boolean };
+  tools?: ToolDefinition[];
+  tool_choice?:
+  | "auto"
+  | "none"
+  | "required"
+  | { type: "function"; function: { name: string } };
+  presence_penalty?: number;
+  frequency_penalty?: number;
+  logprobs?: boolean;
+  seed?: number;
+  user?: string;
+}
+
+export interface ChatCompletionResponse {
+  id: string;
+  object: "chat.completion";
+  created: number;
+  model: string;
+  choices: {
+    index: number;
+    finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
+    logprobs: unknown;
+    message: ChatMessage & { reasoning_content?: string };
+  }[];
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
+  cost?: string;
+}
+
+// Model probe and availability interfaces.
+
+export interface ModelProbeResult {
+  model: string;
+  is_available: boolean;
+  latencyMs: number;
+  checkedAt: string;
+}
+
+export interface AvailableOpencodeModel {
+  availableModel: ModelProbeResult[]
+}
+
+export interface Model {
+  modelName: string
+}
+
+export interface BestModelResult {
+  model: string;
+  latencyMs: number;
+  checkedAt: string;
+}
+===============================================================================
+File Name     : opencodeIdentity.ts
+Relative Path : src/providers/opencode/opencodeIdentity.ts
+===============================================================================
+import crypto from "node:crypto";
+import { opencodeConfig } from "./opencodeConfig";
+
+export interface OpencodeIdentity {
+  session: string;
+  request: string;
+}
+
+/**
+ * Generates a secure random identifier with the given prefix.
+ */
+export function generateId(prefix: string): string {
+  return `${prefix}_${crypto.randomBytes(18).toString("base64url")}`;
+}
+
+/**
+ * Creates a cached identity store with TTL-based rotation.
+ *
+ * Returns the same identity until the TTL expires, then regenerates it.
+ */
+export function createIdentityStore(ttlMs: number) {
+  let cached: OpencodeIdentity | null = null;
+  let expiresAt = 0;
+
+  return {
+    get(): OpencodeIdentity {
+      const now = Date.now();
+      if (!cached || now >= expiresAt) {
+        cached = {
+          session: generateId("ses"),
+          request: generateId("msg"),
+        };
+        expiresAt = now + ttlMs;
+      }
+      return cached;
+    },
+    reset(): void {
+      cached = null;
+      expiresAt = 0;
+    },
+  };
+}
+
+export const opencodeIdentity = createIdentityStore(
+  opencodeConfig.idRotationInterval,
+);
+===============================================================================
+File Name     : opencodeProvider.ts
+Relative Path : src/providers/opencode/opencodeProvider.ts
+===============================================================================
+import {
+  ModelProbeResult,
+  Model,
+  opencodeConfig,
+  AvailableOpencodeModel,
+  BestModelResult,
+} from "./opencodeConfig";
+import { opencodeIdentity } from "./opencodeIdentity";
+
+
+export class OpencodeProvider {
+  private static instance: OpencodeProvider | null = null;
+  private static state: AvailableOpencodeModel = { availableModel: [] };
+  private static probeTimer: ReturnType<typeof setInterval> | null = null;
+  private static isProbing: boolean = false;
+
+  private constructor() {}
+
+  /**
+   * Returns the singleton instance, initializing the probe cycle on first call.
+   */
+  static getInstance() {
+    if (!OpencodeProvider.instance) {
+      OpencodeProvider.instance = new OpencodeProvider();
+      OpencodeProvider.probeAvailableModelCron();
+    }
+    return OpencodeProvider.instance;
+  }
+
+  /**
+   * Returns the lowest-latency model that is currently available.
+   *
+   * Returns null when the provider has not been initialized or
+   * no model is currently available.
+   */
+  public static getBestModel(): BestModelResult | null {
+    if (!OpencodeProvider.instance) {
+      console.warn(
+        "[getBestModel] Instance not initialized. Call getInstance() first.",
+      );
+      return null;
+    }
+
+    const state = OpencodeProvider.state;
+    if (!state || !state.availableModel || state.availableModel.length === 0) {
+      return null;
+    }
+
+    const availableModels = state.availableModel.filter((m) => m.is_available);
+    if (availableModels.length === 0) {
+      return null;
+    }
+
+    const best = availableModels.reduce((prev, curr) =>
+      curr.latencyMs < prev.latencyMs ? curr : prev,
+    );
+
+    return {
+      model: best.model,
+      latencyMs: best.latencyMs,
+      checkedAt: best.checkedAt,
+    };
+  }
+
+
+  /**
+   * Schedules periodic probing of model availability.
+   */
+  private static probeAvailableModelCron(): void {
+    // Reset the existing timer before scheduling a new probe cycle.
+    if (OpencodeProvider.probeTimer) {
+      clearInterval(OpencodeProvider.probeTimer);
+    }
+
+    OpencodeProvider.updateAvailableModelsState();
+
+    OpencodeProvider.probeTimer = setInterval(() => {
+      OpencodeProvider.updateAvailableModelsState();
+    }, opencodeConfig.modelProbeInterval);
+
+    console.log(
+      `[probeAvailableModelCron] Scheduled model probe every ${opencodeConfig.modelProbeInterval}ms`,
+    );
+  }
+
+
+  /**
+   * Refreshes the cached model availability state.
+   *
+   * Skips the probe when a previous probe is still running.
+   * Models that are no longer returned by the provider are kept in the
+   * state but marked as unavailable.
+   */
+  private static async updateAvailableModelsState(): Promise<void> {
+    if (OpencodeProvider.isProbing) {
+      console.warn(
+        "[updateAvailableModelsState] Previous probe still running, skipping.",
+      );
+      return;
+    }
+
+    OpencodeProvider.isProbing = true;
+
+    try {
+      const freeModels = await this.getFreeModelName();
+      const checkedAt = new Date().toISOString();
+
+      if (freeModels.length === 0) {
+        console.warn(
+          "No free models found. Marking all existing models as unavailable.",
+        );
+        const previousState = OpencodeProvider.state.availableModel;
+        OpencodeProvider.state = {
+          availableModel: previousState.map((prev) => ({
+            ...prev,
+            is_available: false,
+            checkedAt,
+          })),
+        };
+        return;
+      }
+
+      const probeResults: ModelProbeResult[] = await Promise.all(
+        freeModels.map((model) => this.probeModel(model.modelName)),
+      );
+
+      const activeModelNames = new Set(freeModels.map((m) => m.modelName));
+      const previousState = OpencodeProvider.state.availableModel;
+      const missingProbeResults: ModelProbeResult[] = previousState
+        .filter((prev) => !activeModelNames.has(prev.model))
+        .map((prev) => ({
+          model: prev.model,
+          is_available: false,
+          latencyMs: Infinity,
+          checkedAt,
+        }));
+
+      OpencodeProvider.state = {
+        availableModel: [...probeResults, ...missingProbeResults],
+      };
+    } finally {
+      // Reset the flag even when the probe throws.
+      OpencodeProvider.isProbing = false;
+    }
+  }
+
+
+  /**
+   * Checks whether a model is usable and measures its response latency.
+   */
+  private static async probeModel(
+    modelName: string,
+  ): Promise<ModelProbeResult> {
+    const checkedAt = new Date().toISOString();
+
+    // ponytail: probe timeout 8s - jangan tunggu 60s per model, 8 model x 60s = hang
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8_000);
+
+    const startTime = performance.now();
+
+    try {
+      const identity = opencodeIdentity.get();
+      const res = await fetch(opencodeConfig.opencodeBaseUrl.chatCompletion, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${opencodeConfig.apiKey}`,
+          "Content-Type": "application/json",
+
+          // Required by the OpenCode endpoint for client/session validation.
+          "User-Agent": "opencode/1.16.0",
+          "x-opencode-client": "cli",
+          "x-opencode-project": "global",
+          "x-opencode-session": identity.session,
+          "x-opencode-request": identity.request,
+        },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 1,
+        }),
+      });
+
+      const latencyMs = performance.now() - startTime;
+
+      if (!res.ok) {
+        return { model: modelName, is_available: false, latencyMs, checkedAt };
+      }
+
+      const data = await res.json();
+      const is_available =
+        Array.isArray(data.choices) && data.choices.length > 0;
+
+      return { model: modelName, is_available, latencyMs, checkedAt };
+    } catch {
+      // Timeout / network error: record as unavailable, do not throw.
+      return {
+        model: modelName,
+        is_available: false,
+        latencyMs: performance.now() - startTime,
+        checkedAt,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Fetches the list of free models from the provider.
+   *
+   * Returns an empty array on timeout, network failure, or non-OK response.
+   */
+  private static async getFreeModelName(): Promise<Model[]> {
+    // Abort when the request exceeds the configured timeout.
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      opencodeConfig.requestTimeout,
+    );
+
+    try {
+      const identity = opencodeIdentity.get();
+      const res = await fetch(opencodeConfig.opencodeBaseUrl.availableModels, {
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${opencodeConfig.apiKey}`,
+
+          // Required by the OpenCode endpoint for client/session validation.
+          "User-Agent": "opencode/1.16.0",
+          "x-opencode-client": "cli",
+          "x-opencode-project": "global",
+          "x-opencode-session": identity.session,
+          "x-opencode-request": identity.request,
+        },
+      });
+
+      if (!res.ok) {
+        console.warn(
+          `[getFreeModelName] Failed to fetch free model names: ${res.status} ${res.statusText}`,
+        );
+        return [];
+      }
+
+      const data = await res.json();
+
+      // Keep only free-tier models.
+      const freeModels: Model[] = data.data
+        .filter((m: { id: string }) => m.id.endsWith("-free"))
+        .map((m: { id: string }) => ({
+          modelName: m.id,
+        }));
+
+      return freeModels;
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        console.warn(
+          `[getFreeModelName] Fetch free available models timed out after ${opencodeConfig.requestTimeout}ms`,
+        );
+      } else {
+        console.warn("[getFreeModelName] Unexpected error:", err);
+      }
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+===============================================================================
+File Name     : openrouterConfig.ts
+Relative Path : src/providers/openrouter/openrouterConfig.ts
+===============================================================================
+import "dotenv/config";
+
+/* =========================================================
+ * OPENROUTER CONFIG
+ * ========================================================= */
+
+export interface OpenRouterConfig {
+  apiKey: string;
+  baseUrl: string;
+  requestTimeout: number;
+}
+
+export const DEFAULT_OPENROUTER_CONFIG: OpenRouterConfig = {
+  apiKey: "",
+  baseUrl: "https://openrouter.ai/api/v1",
+  requestTimeout: 60_000,
+};
+
+/* =========================================================
+ * ENV LOADING
+ * ========================================================= */
+
+export function getOpenRouterKeyFromEnv(): string {
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key || !key.trim()) {
+    throw new Error(
+      "[OpenRouterConfig] OPENROUTER_API_KEY is not set in environment.",
+    );
+  }
+  return key.trim();
+}
+
+export function createOpenRouterConfig(): OpenRouterConfig {
+  return {
+    ...DEFAULT_OPENROUTER_CONFIG,
+    apiKey: getOpenRouterKeyFromEnv(),
+  };
+}
+===============================================================================
+File Name     : openrouterProvider.ts
+Relative Path : src/providers/openrouter/openrouterProvider.ts
+===============================================================================
+import {
+  OpenRouterConfig,
+  createOpenRouterConfig,
+} from "./openrouterConfig";
+
+// OPENCODE PROVIDER IS NOT AVAILABLE YET. THIS PROVIDER IS ALSO STILL HAS THROW ERROR FEATURES IN CONFIG.
+
+/* =========================================================
+ * SESSION
+ * ========================================================= */
+
+export interface OpenRouterSession {
+  /** Nomor urut request (1-based). */
+  readonly id: number;
+  /** API key OpenRouter. */
+  readonly apiKey: string;
+  /**
+   * Panggil setelah dapat response untuk mencatat jumlah token
+   * yang baru saja digunakan pada request ini.
+   */
+  updateTokenCount(tokens: number): void;
+}
+
+/* =========================================================
+ * PROVIDER (SINGLETON)
+ * ========================================================= */
+
+export class OpenRouterProvider {
+  private static instance: OpenRouterProvider | null = null;
+
+  private readonly config: OpenRouterConfig;
+  private requestCount = 0;
+  private totalTokensUsed = 0;
+
+  private constructor(config: OpenRouterConfig) {
+    this.config = config;
+  }
+
+  /* =======================================================
+   * INITIALIZE
+   * ======================================================= */
+
+  /**
+   * Initializes the singleton with the given config.
+   *
+   * Throws when the provider has already been initialized.
+   */
+  static initialize(
+    config: OpenRouterConfig = createOpenRouterConfig(),
+  ): OpenRouterProvider {
+    if (OpenRouterProvider.instance !== null) {
+      throw new Error("OpenRouterProvider has already been initialized.");
+    }
+    OpenRouterProvider.instance = new OpenRouterProvider(config);
+    return OpenRouterProvider.instance;
+  }
+
+  /* =======================================================
+   * GET INSTANCE
+   * ======================================================= */
+
+  /**
+   * Returns the singleton instance, creating it from environment
+   * when not yet initialized.
+   */
+  static getInstance(): OpenRouterProvider {
+    if (OpenRouterProvider.instance === null) {
+      OpenRouterProvider.instance = new OpenRouterProvider(
+        createOpenRouterConfig(),
+      );
+    }
+    return OpenRouterProvider.instance;
+  }
+
+  /* =======================================================
+   * RESET (TEST HELPER)
+   * ======================================================= */
+
+  /**
+   * Resets the singleton. Test helper only.
+   */
+  static _resetForTest(): void {
+    OpenRouterProvider.instance = null;
+  }
+
+  /* =======================================================
+   * GET SESSION
+   * ======================================================= */
+
+  /**
+   * Generates a new session for a single request.
+   *
+   * Each call increments the internal request counter.
+   * The returned session carries the API key and an
+   * `updateTokenCount(tokens)` callback the caller should invoke
+   * after receiving a successful response to track token usage.
+   */
+  getSession(): OpenRouterSession {
+    this.requestCount++;
+
+    const id = this.requestCount;
+    const apiKey = this.config.apiKey;
+    const self = this;
+
+    const session: OpenRouterSession = {
+      id,
+      apiKey,
+      updateTokenCount(tokens: number) {
+        if (!Number.isFinite(tokens) || tokens < 0) {
+          throw new Error(`Invalid token count: ${tokens}`);
+        }
+        self.totalTokensUsed += tokens;
+      },
+    };
+
+    return session;
+  }
+
+  /* =======================================================
+   * STATS
+   * ======================================================= */
+
+  /**
+   * Returns the total number of sessions created since initialization.
+   */
+  getRequestCount(): number {
+    return this.requestCount;
+  }
+
+  /**
+   * Returns the total number of tokens recorded via
+   * `updateTokenCount()` since initialization.
+   */
+  getTotalTokensUsed(): number {
+    return this.totalTokensUsed;
+  }
+}
+===============================================================================
+File Name     : tavilyConfig.ts
+Relative Path : src/providers/tavily/tavilyConfig.ts
+===============================================================================
+/**
+ * Base URL Tavily API
+ * Docs: https://docs.tavily.com/documentation/api-reference/endpoint/search
+ * curl --url https://api.tavily.com/search --header 'Authorization: Bearer tvly-...'
+ */
+export const TAVILY_API_BASE_URL = "https://api.tavily.com"
+
+/**
+ * Maximum allowed usage per API key before it is considered exhausted.
+ * Advanced search require 2 credit per search, so 500 is very reliable limit
+ */
+export const TAVILY_USAGE_LIMIT = 500
+
+/**
+ * Sentinel value returned when no API keys are available or all have reached the limit.
+ */
+export const TAVILY_EXHAUSTED_USE_COUNT = 9999
+
+/**
+ * Internal record tracking usage per API key.
+ */
+export interface TavilyApiKeyRecord {
+  id: number
+  apiKey: string
+  useCount: number
+}
+
+/**
+ * Session returned by TavilyProvider.getApiKey().
+ * - `apiKey` is empty when no keys are available or all have reached the limit.
+ * - `useCount` is set to `TAVILY_EXHAUSTED_USE_COUNT` as a sentinel when exhausted.
+ */
+export interface TavilyApiKeySession {
+  apiKey: string
+  useCount: number
+}
+===============================================================================
+File Name     : tavilyProvider.ts
+Relative Path : src/providers/tavily/tavilyProvider.ts
+===============================================================================
+import {
+  TAVILY_USAGE_LIMIT,
+  TAVILY_EXHAUSTED_USE_COUNT,
+  TavilyApiKeyRecord,
+  TavilyApiKeySession,
+} from "./tavilyConfig"
+
+export class TavilyProvider {
+  private static instance: TavilyProvider | null = null
+  private records: TavilyApiKeyRecord[] | null = null
+
+  private constructor() {}
+
+  /**
+   * Returns the singleton instance of TavilyProvider.
+   */
+  public static getInstance(): TavilyProvider {
+    if (!TavilyProvider.instance) {
+      TavilyProvider.instance = new TavilyProvider()
+    }
+    return TavilyProvider.instance
+  }
+
+  /**
+   * Initializes API key records from environment variables if not already initialized.
+   */
+  private initiateRecords(): void {
+    if (this.records !== null) {
+      return
+    }
+
+    const keys = this.getKeysFromEnv()
+
+    this.records = keys.map((apiKey, index) => ({
+      id: index + 1,
+      apiKey,
+      useCount: 0,
+    }))
+  }
+
+  /**
+   * Retrieves API keys from the TAVILY_API_KEY environment variable.
+   * Expects a comma-separated list of keys (e.g. "tvly-aaa,tvly-bbb").
+   * Docs: Bearer tvly-YOUR_API_KEY (https://docs.tavily.com/documentation/api-reference/endpoint/search)
+   */
+  private getKeysFromEnv(): string[] {
+    const raw = process.env.TAVILY_API_KEY
+
+    if (!raw || raw.trim().length === 0) {
+      console.warn(
+        "Warning: TAVILY_API_KEY not found in environment variables."
+      )
+      return []
+    }
+
+    return raw
+      .split(",")
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0)
+      .filter((k, i, arr) => arr.indexOf(k) === i)
+  }
+
+  /**
+   * Returns the least-used API key and increments its usage count.
+   * Filters out keys that have reached the usage limit (500).
+   * Returns a sentinel session with empty apiKey if none available.
+   */
+  public getApiKey(): TavilyApiKeySession {
+    if (this.records === null) {
+      this.initiateRecords()
+    }
+
+    if (!this.records || this.records.length === 0) {
+      return {
+        apiKey: "",
+        useCount: TAVILY_EXHAUSTED_USE_COUNT,
+      }
+    }
+
+    const available = this.records.filter(
+      (record) => record.useCount < TAVILY_USAGE_LIMIT
+    )
+
+    if (available.length === 0) {
+      console.warn("no tavily api key available, all keys exhausted")
+      return {
+        apiKey: "",
+        useCount: TAVILY_EXHAUSTED_USE_COUNT,
+      }
+    }
+
+    const selected = available.reduce(
+      (min, record) => (record.useCount < min.useCount ? record : min),
+      available[0]
+    )
+
+    selected.useCount += 1
+
+    return {
+      apiKey: selected.apiKey,
+      useCount: selected.useCount,
+    }
+  }
+
+  /**
+   * Helper: returns Authorization header value for direct fetch usage.
+   * Example: "Bearer tvly-xxx"
+   * Note: this also increments usage via getApiKey().
+   */
+  public getAuthHeader(): string {
+    const { apiKey } = this.getApiKey()
+    return apiKey ? `Bearer ${apiKey}` : ""
+  }
+
+  /**
+   * Test helper: reset singleton (only for tests).
+   */
+  public static _resetForTest(): void {
+    TavilyProvider.instance = null
+  }
+}
+
+export default TavilyProvider
+===============================================================================
+File Name     : agent_error.ts
+Relative Path : src/types/agent_types/agent_error.ts
+===============================================================================
+import { z } from "zod";
+
+export const ServerErrorSchema = z.object({
+  message: z.string(),
+  type: z.string(),
+  param: z.string().nullable().optional(),
+  code: z.string().nullable().optional(),
+  details: z.unknown().optional(),
+});
+
+export type ServerError = z.infer<typeof ServerErrorSchema>;
+
+export const AgentErrorResponseSchema = z.object({
+  error: ServerErrorSchema,
+});
+
+export type AgentErrorResponse = z.infer<typeof AgentErrorResponseSchema>;
+
+export class AgentError extends Error {
+  readonly error: ServerError;
+  constructor(err: ServerError) {
+    super(err.message);
+    this.name = "AgentError";
+    this.error = err;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+
+  toResponse(): AgentErrorResponse {
+    return AgentErrorResponseSchema.parse({ error: this.error });
+  }
+}
+
+export function createAgentError(
+  message: string,
+  type: string = "invalid_request_error",
+  param: string | null = null,
+  code: string | null = null,
+  details?: unknown
+): AgentError {
+  return new AgentError({
+    message,
+    type,
+    param,
+    code,
+    ...(details !== undefined ? { details } : {}),
+  });
+}
+
+// ponytail: alias untuk backward compat, hapus jika full rename breaking selesai
+export const createAgentErrorResponse = createAgentError;
+===============================================================================
+File Name     : agent_request.ts
+Relative Path : src/types/agent_types/agent_request.ts
+===============================================================================
+import { z } from "zod";
+
+// ------------------------------------------------------------
+// Content parts
+// ------------------------------------------------------------
+
+const TextContentPartSchema = z.object({
+  type: z.literal("text"),
+  text: z.string(),
+  cache_prompt: z.boolean().optional(),
+});
+
+const ImageUrlContentPartSchema = z.object({
+  type: z.literal("image_url"),
+  image_url: z.object({ url: z.string() }),
+  cache_prompt: z.boolean().optional(),
+});
+
+const ContentPartSchema = z.discriminatedUnion("type", [
+  TextContentPartSchema,
+  ImageUrlContentPartSchema,
+]);
+
+const MessageContentSchema = z.union([
+  z.string(),
+  z.array(ContentPartSchema),
+  z.null(),
+]);
+
+// ------------------------------------------------------------
+// Tool calls (dalam assistant message)
+// ------------------------------------------------------------
+
+const ToolCallSchema = z.object({
+  id: z.string(),
+  type: z.literal("function"),
+  function: z.object({
+    name: z.string(),
+    arguments: z.string(),
+  }),
+});
+
+// ------------------------------------------------------------
+// Messages
+// ------------------------------------------------------------
+
+const MessageRoleSchema = z.enum([
+  "system",
+  "user",
+  "assistant",
+  "function",
+  "tool",
+]);
+
+const ChatMessageSchema = z.object({
+  role: MessageRoleSchema,
+  content: MessageContentSchema.nullish(),
+  name: z.string().optional(),
+  tool_calls: z.array(ToolCallSchema).optional(),
+  tool_call_id: z.string().optional(),
+  function_call: z
+    .object({ name: z.string(), arguments: z.string() })
+    .optional(),
+});
+
+// ------------------------------------------------------------
+// Tool definitions
+// ------------------------------------------------------------
+
+const ToolParametersSchema = z
+  .object({
+    type: z.literal("object"),
+    properties: z.record(z.string(), z.record(z.string(), z.unknown())),
+    required: z.array(z.string()).optional(),
+  })
+  .passthrough();
+
+const ToolDefinitionSchema = z.object({
+  type: z.literal("function"),
+  function: z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    parameters: ToolParametersSchema.optional(),
+  }),
+});
+
+// ------------------------------------------------------------
+// Tool choice
+// ------------------------------------------------------------
+
+const ToolChoiceSchema = z.union([
+  z.literal("none"),
+  z.literal("auto"),
+  z.literal("required"),
+  z.object({
+    type: z.literal("function"),
+    function: z.object({ name: z.string() }),
+  }),
+]);
+
+// MISING: thingking option. usually require extending the fields, but without thingking extend work just fine. 
+export const AgentCompletionRequest = z
+  .object({
+    model: z.string(),
+    messages: z.array(ChatMessageSchema).min(1),
+    fallback: z.boolean().optional(),
+    temperature: z.number().optional(),
+    top_p: z.number().optional(),
+    max_tokens: z.number().int().positive().optional(),
+    tools: z.array(ToolDefinitionSchema).optional(),
+    tool_choice: ToolChoiceSchema.optional(),
+    stream: z.boolean().optional(),
+    response_format: z
+      .object({ type: z.enum(["text", "json_object"]) })
+      .optional(),
+    frequency_penalty: z.number().optional(),
+    presence_penalty: z.number().optional(),
+    stop: z.union([z.string(), z.array(z.string())]).optional(),
+    n: z.number().int().positive().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (!data.tools) return;
+
+    data.tools.forEach((tool, toolIndex) => {
+      const params = tool.function.parameters;
+      if (!params?.required) return;
+
+      const propKeys = Object.keys(params.properties ?? {});
+      const missing = params.required.filter((r) => !propKeys.includes(r));
+
+      if (missing.length > 0) {
+        ctx.addIssue({
+          code: "custom",
+          message: `Tool "${tool.function.name}" has "required" field(s) [${missing.join(", ")}] not present in "properties"`,
+          path: ["tools", toolIndex, "function", "parameters", "required"],
+        });
+      }
+    });
+  });
+
+export type AgentCompletionRequestType = z.infer<typeof AgentCompletionRequest>;
+===============================================================================
+File Name     : agent_response.ts
+Relative Path : src/types/agent_types/agent_response.ts
+===============================================================================
+import { z } from "zod";
+
+export const ToolCallSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  function: z.object({
+    name: z.string(),
+    arguments: z.string(),
+  }),
+});
+export type ToolCall = z.infer<typeof ToolCallSchema>;
+
+const ResponseTextContentPartSchema = z.object({
+  type: z.literal("text"),
+  text: z.string(),
+});
+
+const ResponseImageContentPartSchema = z.object({
+  type: z.literal("image_url"),
+  image_url: z.object({ url: z.string() }),
+});
+
+const ResponseContentSchema = z.union([
+  z.string(),
+  z.array(
+    z.union([ResponseTextContentPartSchema, ResponseImageContentPartSchema]),
+  ),
+  z.null(),
+]);
+
+export const AssistantMessageSchema = z.object({
+  role: z.literal("assistant"),
+  content: ResponseContentSchema.nullish(),
+  tool_calls: z.array(ToolCallSchema).nullish(),
+  reasoning_content: z.string().nullable().optional(),
+});
+export type AssistantMessage = z.infer<typeof AssistantMessageSchema>;
+
+export const FinishReasonSchema = z.enum([
+  "stop",
+  "length",
+  "tool_calls",
+  "content_filter",
+  "function_call",
+  "insufficient_system_resource",
+  "null",
+  "error",
+]);
+export type FinishReason = z.infer<typeof FinishReasonSchema>;
+
+export const ChoiceSchema = z.object({
+  index: z.number().int().nonnegative(),
+  message: AssistantMessageSchema,
+  finish_reason: FinishReasonSchema.nullable(),
+  logprobs: z.null().default(null),
+});
+export type Choice = z.infer<typeof ChoiceSchema>;
+
+export const UsageSchema = z.object({
+  prompt_tokens: z.number().int().nonnegative(),
+  completion_tokens: z.number().int().nonnegative(),
+  total_tokens: z.number().int().nonnegative(),
+  cached_content_token_count: z.number().int().nonnegative().optional(),
+  thoughts_token_count: z.number().int().nonnegative().optional(),
+});
+export type Usage = z.infer<typeof UsageSchema>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. AgentCompletionResponse (non-streaming)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const AgentCompletionResponse = z.object({
+  id: z.string(),
+  object: z.literal("chat.completion"),
+  created: z.number().int(),
+  model: z.string(),
+  choices: z.array(ChoiceSchema).min(1),
+  usage: UsageSchema.optional(),
+  system_fingerprint: z.string().optional(),
+});
+export type AgentCompletionResponse = z.infer<typeof AgentCompletionResponse>;
+
+export const DeltaSchema = z.object({
+  role: z.literal("assistant").optional(),
+  content: z.string().nullable().optional(),
+  tool_calls: z
+    .array(
+      z.object({
+        index: z.number().int(),
+        id: z.string().optional(),
+        type: z.literal("function").optional(),
+        function: z
+          .object({
+            name: z.string().optional(),
+            arguments: z.string().optional(),
+          })
+          .optional(),
+      }),
+    )
+    .optional(),
+  reasoning_content: z.string().nullable().optional(),
+});
+export type Delta = z.infer<typeof DeltaSchema>;
+
+export const ChunkChoiceSchema = z.object({
+  index: z.number().int().nonnegative(),
+  delta: DeltaSchema,
+  finish_reason: FinishReasonSchema.nullable(),
+  logprobs: z.null().default(null),
+});
+
+export const AgentCompletionChunk = z.object({
+  id: z.string(),
+  object: z.literal("chat.completion.chunk"),
+  created: z.number().int(),
+  model: z.string(),
+  choices: z.array(ChunkChoiceSchema),
+  usage: UsageSchema.optional(),
+});
+export type AgentCompletionChunk = z.infer<typeof AgentCompletionChunk>;
+===============================================================================
+File Name     : crawl.ts
+Relative Path : src/types/tavily/crawl.ts
+===============================================================================
+import { z } from "zod";
+
+// ─────────────────────────────────────────────────────────────
+// Crawl Request — docs.tavily.com/documentation/api-reference/endpoint/crawl
+// ─────────────────────────────────────────────────────────────
+
+export const TavilyCrawlRequestSchema = z.object({
+  /** The root URL to begin the crawl. */
+  url: z.string().url("Must be a valid URL").min(1, "url must not be empty"),
+
+  /** Natural language instructions for the crawler (what to find). */
+  instructions: z.string().optional(),
+
+  /** Max depth of the crawl (1–5). Defines how far from base URL to explore. */
+  max_depth: z.number().int().min(1).max(5).optional().default(1),
+
+  /** Max number of links to follow per level (1–500). */
+  max_breadth: z.number().int().min(1).max(500).optional().default(20),
+
+  /**
+   * Total number of links the crawler will process before stopping.
+   * Local safeguard: capped at 100 to prevent excessive credit usage.
+   * The official Tavily API does not enforce a strict hard limit for this field.
+   */
+  limit: z.number().int().min(1).max(100).optional().default(50),
+
+  /** Regex patterns to restrict crawling to specific paths. */
+  select_paths: z.array(z.string()).nullable().optional().default(null),
+
+  /** Regex patterns to restrict crawling to specific domains. */
+  select_domains: z.array(z.string()).nullable().optional().default(null),
+
+  /** Regex patterns to exclude specific paths. */
+  exclude_paths: z.array(z.string()).nullable().optional().default(null),
+
+  /** Regex patterns to exclude specific domains. */
+  exclude_domains: z.array(z.string()).nullable().optional().default(null),
+
+  /** Whether to allow crawling external domains. */
+  allow_external: z.boolean().optional().default(true),
+
+  /** Whether to include images in crawl results. */
+  include_images: z.boolean().optional().default(false),
+
+  /** Depth of extraction: basic vs advanced (includes tables/embedded). */
+  extract_depth: z.enum(["basic", "advanced"]).optional().default("basic"),
+
+  /** Output format for raw_content. */
+  format: z.enum(["markdown", "text"]).optional().default("markdown"),
+
+  /** Whether to include favicon URL for each result. */
+  include_favicon: z.boolean().optional().default(false),
+
+  /** Max number of relevant chunks returned per source (1–5). */
+  chunks_per_source: z.number().int().min(1).max(5).optional().default(3),
+
+  /** Maximum time in seconds to wait for crawl before timing out (10–150). */
+  timeout: z.number().min(10).max(150).optional().default(150),
+
+  /** Whether to include credit usage information in the response. */
+  include_usage: z.boolean().optional().default(false),
+});
+
+export type TavilyCrawlRequest = z.infer<typeof TavilyCrawlRequestSchema>;
+
+// ─────────────────────────────────────────────────────────────
+// Crawl Response — individual crawled page
+// ─────────────────────────────────────────────────────────────
+
+export const TavilyCrawlResultSchema = z.object({
+  /** URL of the crawled page. */
+  url: z.string(),
+
+  /** Extracted content of the page. */
+  raw_content: z.string(),
+
+  /** Favicon URL (if include_favicon was true). */
+  favicon: z.string().optional(),
+
+  /** Images extracted (if include_images was true). */
+  images: z.array(z.unknown()).optional(),
+
+  /** Relevance score if query/instructions was provided. */
+  score: z.number().optional(),
+});
+
+export type TavilyCrawlResult = z.infer<typeof TavilyCrawlResultSchema>;
+
+// ─────────────────────────────────────────────────────────────
+// Crawl Response — full crawl response
+// ─────────────────────────────────────────────────────────────
+
+export const TavilyCrawlResponseSchema = z.object({
+  /** The base URL that was crawled. */
+  base_url: z.string(),
+
+  /** List of extracted content from crawled URLs. */
+  results: z.array(TavilyCrawlResultSchema),
+
+  /** Time taken to process the request (in seconds). */
+  response_time: z.union([z.string(), z.number()]),
+
+  /** Usage information (if include_usage was true). */
+  usage: z
+    .object({
+      credits: z.number().optional(),
+    })
+    .optional(),
+
+  /** Unique request identifier. */
+  request_id: z.string().optional(),
+});
+
+export type TavilyCrawlResponse = z.infer<typeof TavilyCrawlResponseSchema>;
+===============================================================================
+File Name     : error.ts
+Relative Path : src/types/tavily/error.ts
+===============================================================================
+import { z } from "zod";
+
+// ============================================================
+// 1. RAW TAVILY ERROR
+// ============================================================
+//
+// This schema represents the error response exactly as returned
+// by the Tavily API.
+//
+// Example:
+// {
+//   "detail": {
+//     "error": "Rate limit exceeded"
+//   }
+// }
+//
+// This schema should stay close to Tavily's API contract.
+// ============================================================
+
+export const TavilyRawErrorResponseSchema = z.object({
+  detail: z.object({
+    error: z.string(),
+  }),
+});
+
+export type TavilyRawErrorResponse = z.infer<
+  typeof TavilyRawErrorResponseSchema
+>;
+
+// ============================================================
+// 2. CUSTOM ERROR TYPES
+// ============================================================
+//
+// These types belong to our application, not to Tavily.
+//
+// Their purpose is to convert different Tavily/API failures into
+// a consistent format that the rest of the application can use.
+// ============================================================
+
+export const TavilyErrorCodeSchema = z.enum([
+  "INVALID_REQUEST",
+  "UNAUTHORIZED",
+  "FORBIDDEN",
+  "RATE_LIMITED",
+  "QUOTA_EXCEEDED",
+  "INTERNAL_ERROR",
+  "TIMEOUT",
+  "UNKNOWN",
+]);
+
+export type TavilyErrorCode = z.infer<typeof TavilyErrorCodeSchema>;
+
+export const TavilyEndpointSchema = z.enum([
+  "search",
+  "extract",
+  "crawl",
+  "map",
+]);
+
+export type TavilyEndpoint = z.infer<typeof TavilyEndpointSchema>;
+
+// ============================================================
+// Normalized error information used by our application.
+// ============================================================
+
+export interface TavilyErrorInfo {
+  /** Normalized machine-readable error code. */
+  code: TavilyErrorCode;
+
+  /** Human-readable error message. */
+  message: string;
+
+  /** HTTP status returned by Tavily, if available. */
+  httpStatus: number | null;
+
+  /** Tavily endpoint that failed. */
+  endpoint?: TavilyEndpoint;
+
+  /** Whether retrying the request may succeed. */
+  retryable: boolean;
+
+  /** Original error message returned by Tavily. */
+  raw: string;
+
+  /** Optional suggestion for handling the error. */
+  hint?: string;
+}
+
+// ============================================================
+// 3. ERROR PARSER
+// ============================================================
+//
+// Converts a raw Tavily/API error into our normalized format.
+//
+// Input:
+//   HTTP status + raw error message
+//
+// Output:
+//   TavilyErrorInfo
+//
+// This is the boundary between the external Tavily format and
+// our internal application format.
+// ============================================================
+
+export function parseTavilyError(
+  httpStatus: number | null,
+  raw: string,
+  endpoint?: TavilyEndpoint,
+): TavilyErrorInfo {
+  const message = raw;
+  const lower = raw.toLowerCase();
+
+  // ----------------------------------------------------------
+  // 400 - Invalid request
+  // ----------------------------------------------------------
+  if (
+    httpStatus === 400 ||
+    lower.includes("bad request") ||
+    lower.includes("max 20 urls") ||
+    lower.includes("no starting url") ||
+    lower.includes("empty query")
+  ) {
+    return {
+      code: "INVALID_REQUEST",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: false,
+      raw,
+      hint: "Check the request parameters, such as query or URL.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 401 - Authentication failure
+  // ----------------------------------------------------------
+  if (
+    httpStatus === 401 ||
+    lower.includes("unauthorized") ||
+    lower.includes("api key")
+  ) {
+    return {
+      code: "UNAUTHORIZED",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: false,
+      raw,
+      hint: "Check the Tavily API key or Bearer token.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 403 - Forbidden / unsupported resource
+  // ----------------------------------------------------------
+  if (
+    httpStatus === 403 ||
+    lower.includes("forbidden") ||
+    lower.includes("not supported")
+  ) {
+    return {
+      code: "FORBIDDEN",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: false,
+      raw,
+      hint: "The requested URL or resource is not supported by Tavily.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 429 - Rate limit
+  // ----------------------------------------------------------
+  if (
+    httpStatus === 429 ||
+    lower.includes("rate limit") ||
+    lower.includes("excessive requests") ||
+    lower.includes("blocked due to")
+  ) {
+    return {
+      code: "RATE_LIMITED",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: true,
+      raw,
+      hint: "Reduce request frequency and retry with backoff.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 432 - Quota exceeded
+  // ----------------------------------------------------------
+  if (
+    httpStatus === 432 ||
+    lower.includes("usage limit") ||
+    lower.includes("pay-as-you-go limit") ||
+    lower.includes("upgrade your plan")
+  ) {
+    return {
+      code: "QUOTA_EXCEEDED",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: false,
+      raw,
+      hint: "The Tavily quota has been exceeded.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 500 - Internal server error
+  // ----------------------------------------------------------
+  if (httpStatus === 500 || lower.includes("internal server error")) {
+    return {
+      code: "INTERNAL_ERROR",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: true,
+      raw,
+      hint: "Tavily encountered an internal error. Retry with backoff.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 504 - Timeout
+  // ----------------------------------------------------------
+  if (
+    httpStatus === 504 ||
+    lower.includes("timeout") ||
+    lower.includes("timed out")
+  ) {
+    return {
+      code: "TIMEOUT",
+      message,
+      httpStatus,
+      endpoint,
+      retryable: true,
+      raw,
+      hint: "The request timed out. Retry or reduce the request scope.",
+    };
+  }
+
+  // ----------------------------------------------------------
+  // Unknown error
+  // ----------------------------------------------------------
+  return {
+    code: "UNKNOWN",
+    message,
+    httpStatus,
+    endpoint,
+    retryable: false,
+    raw,
+  };
+}
+
+// ============================================================
+// 4. CUSTOM TAVILY ERROR
+// ============================================================
+//
+// This class represents the final error object used by our
+// application.
+//
+// It extends JavaScript's built-in Error so it can be thrown
+// and caught normally, while also carrying additional Tavily-
+// specific information such as:
+//   - error code
+//   - HTTP status
+//   - endpoint
+//   - retryability
+//   - original error message
+//   - handling hint
+//
+// Example:
+//
+//   throw new TavilyError(errorInfo);
+//
+//   catch (error) {
+//     if (error instanceof TavilyError) {
+//       console.log(error.code);
+//     }
+//   }
+// ============================================================
+
+export class TavilyError extends Error {
+  readonly code: TavilyErrorCode;
+  readonly httpStatus: number | null;
+  readonly endpoint?: TavilyEndpoint;
+  readonly retryable: boolean;
+  readonly raw: string;
+  readonly hint?: string;
+
+  constructor(info: TavilyErrorInfo) {
+    // Initialize the built-in Error with the human-readable message.
+    super(info.message);
+
+    // Give the error a specific name for logging and debugging.
+    this.name = "TavilyError";
+
+    // Store the normalized Tavily error information.
+    this.code = info.code;
+    this.httpStatus = info.httpStatus;
+    this.endpoint = info.endpoint;
+    this.retryable = info.retryable;
+    this.raw = info.raw;
+    this.hint = info.hint;
+
+    // Ensure the prototype chain is correct so that
+    // `error instanceof TavilyError` works reliably.
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+} 
+
+// ============================================================
+// 5. ERROR FACTORY
+// ============================================================
+//
+// Creates a TavilyError from raw Tavily error information.
+//
+// The caller only needs to provide the HTTP status, raw error
+// message, and endpoint. This function handles the two internal
+// steps automatically:
+//
+//   1. Parse the raw error into TavilyErrorInfo.
+//   2. Create a TavilyError from that normalized information.
+//
+// This keeps error parsing and error construction in one place,
+// so callers do not need to know how either step is implemented.
+//
+// Example:
+//
+//   throw createTavilyError(
+//     429,
+//     "Too many requests",
+//     "search",
+//   );
+// ============================================================
+
+export function createTavilyError(
+  httpStatus: number | null,
+  raw: string,
+  endpoint?: TavilyEndpoint,
+): TavilyError {
+  // Convert the raw Tavily error into our normalized
+  // application-level error format.
+  const errorInfo = parseTavilyError(httpStatus, raw, endpoint);
+
+  // Create the actual JavaScript Error object that can be thrown.
+  return new TavilyError(errorInfo);
+}
+===============================================================================
+File Name     : extract.ts
+Relative Path : src/types/tavily/extract.ts
+===============================================================================
+import { z } from "zod";
+
+// ─────────────────────────────────────────────────────────────
+// Extract Request — docs.tavily.com/documentation/api-reference/endpoint/extract
+// ─────────────────────────────────────────────────────────────
+
+export const TavilyExtractRequestSchema = z.object({
+  /** One or more URLs to extract. Max 20 URLs. */
+  urls: z.union([
+    z.string().url(),
+    z.array(z.string().url()).min(1).max(20),
+  ]),
+
+  /** Query to rerank chunks based on relevance. Chunks appear in raw_content as <chunk>. */
+  query: z.string().optional(),
+
+  /** Max number of relevant chunks returned per source (1–5). Only when query is provided. */
+  chunks_per_source: z.number().int().min(1).max(5).optional().default(3),
+
+  /** Depth of extraction: basic (1 credit/5 urls) vs advanced (2 credits/5 urls, includes tables/embedded). */
+  extract_depth: z.enum(["basic", "advanced"]).optional().default("basic"),
+
+  /** Whether to include images in the response. */
+  include_images: z.boolean().optional().default(false),
+
+  /** Whether to include favicon URL for each result. */
+  include_favicon: z.boolean().optional().default(false),
+
+  /** Output format for raw_content. */
+  format: z.enum(["markdown", "text"]).optional().default("markdown"),
+
+  /** Maximum time in seconds to wait before timing out (1.0–60.0). Default 10s basic / 30s advanced. */
+  timeout: z.number().min(1.0).max(60.0).optional(),
+
+  /** Whether to include credit usage information in the response. */
+  include_usage: z.boolean().optional().default(false),
+});
+
+export type TavilyExtractRequest = z.infer<typeof TavilyExtractRequestSchema>;
+
+// ─────────────────────────────────────────────────────────────
+// Extract Response — individual result item
+// ─────────────────────────────────────────────────────────────
+
+export const TavilyExtractResultSchema = z.object({
+  /** URL that was extracted. */
+  url: z.string(),
+
+  /** Extracted content (markdown or text based on format). */
+  raw_content: z.string(),
+
+  /** Images extracted from the page (if include_images was true). */
+  images: z.array(z.unknown()).optional(),
+
+  /** Favicon URL (if include_favicon was true). */
+  favicon: z.string().optional(),
+});
+
+export type TavilyExtractResult = z.infer<typeof TavilyExtractResultSchema>;
+
+export const TavilyExtractFailedResultSchema = z.object({
+  /** URL that failed to extract. */
+  url: z.string(),
+
+  /** Error reason for failure. */
+  error: z.string(),
+});
+
+export type TavilyExtractFailedResult = z.infer<typeof TavilyExtractFailedResultSchema>;
+
+// ─────────────────────────────────────────────────────────────
+// Extract Response — full extract response
+// ─────────────────────────────────────────────────────────────
+
+export const TavilyExtractResponseSchema = z.object({
+  /** List of successfully extracted pages. */
+  results: z.array(TavilyExtractResultSchema),
+
+  /** List of URLs that failed to extract. */
+  failed_results: z.array(TavilyExtractFailedResultSchema).optional().default([]),
+
+  /** Time taken to process the request (in seconds). */
+  response_time: z.union([z.string(), z.number()]),
+
+  /** Usage information (if include_usage was true). May be 0 if <5 extractions. */
+  usage: z
+    .object({
+      credits: z.number().optional(),
+    })
+    .optional(),
+
+  /** Unique request identifier. */
+  request_id: z.string().optional(),
+});
+
+export type TavilyExtractResponse = z.infer<typeof TavilyExtractResponseSchema>;
+===============================================================================
+File Name     : index.ts
+Relative Path : src/types/tavily/index.ts
+===============================================================================
+export * from "./search";
+export * from "./extract";
+export * from "./crawl";
+export * from "./error";
+===============================================================================
+File Name     : search.ts
+Relative Path : src/types/tavily/search.ts
+===============================================================================
+import { z } from "zod";
+
+// ─────────────────────────────────────────────────────────────
+// Search Request — docs.tavily.com/documentation/api-reference/endpoint/search
+// ─────────────────────────────────────────────────────────────
+
+export const TavilySearchRequestSchema = z.object({
+  /** The search query to execute with Tavily. */
+  query: z.string().min(1, "Query must not be empty"),
+
+  /** Controls the latency vs. relevance tradeoff. */
+  search_depth: z
+    .enum(["basic", "advanced", "fast", "ultra-fast"])
+    .optional()
+    .default("basic"),
+
+  /** The category of the search. */
+  topic: z.enum(["general", "news", "finance"]).optional().default("general"),
+
+  /** The maximum number of search results to return (0–20). */
+  max_results: z.number().int().min(0).max(20).optional().default(5),
+
+  /** Max number of relevant chunks returned per source (1–3). */
+  chunks_per_source: z.number().int().min(1).max(3).optional().default(3),
+
+  /** Include an LLM-generated answer to the query. */
+  include_answer: z
+    .union([z.boolean(), z.enum(["basic", "advanced"])])
+    .optional()
+    .default(false),
+
+  /** Include the cleaned and parsed HTML content of each result. */
+  include_raw_content: z
+    .union([z.boolean(), z.enum(["markdown", "text"])])
+    .optional()
+    .default(false),
+
+  /** Include images in the response. */
+  include_images: z.boolean().optional().default(false),
+
+  /** When include_images is true, also add a descriptive text for each image. */
+  include_image_descriptions: z.boolean().optional().default(false),
+
+  /** Whether to include the favicon URL for each result. */
+  include_favicon: z.boolean().optional().default(false),
+
+  /** A list of domains to specifically include in the search results. Max 300. */
+  include_domains: z.array(z.string()).max(300).optional().default([]),
+
+  /** A list of domains to specifically exclude from the search results. Max 150. */
+  exclude_domains: z.array(z.string()).max(150).optional().default([]),
+
+  /** Filter results based on publish/updated date. */
+  time_range: z
+    .enum(["day", "week", "month", "year", "d", "w", "m", "y"])
+    .nullable()
+    .optional()
+    .default(null),
+
+  /** Will return all results after the specified start date (YYYY-MM-DD). */
+  start_date: z.string().nullable().optional().default(null),
+
+  /** Will return all results before the specified end date (YYYY-MM-DD). */
+  end_date: z.string().nullable().optional().default(null),
+
+  /** Boost search results from a specific country (only if topic is general). */
+  country: z.string().nullable().optional().default(null),
+
+  /** When true, Tavily auto-configures search parameters based on query intent. */
+  auto_parameters: z.boolean().optional().default(false),
+
+  /** Ensure only results containing exact quoted phrase(s) are returned. */
+  exact_match: z.boolean().optional().default(false),
+
+  /** Whether to include credit usage information in the response. */
+  include_usage: z.boolean().optional().default(false),
+
+  /** Enterprise only: whether to filter out adult or unsafe content. Not supported for `fast` or `ultra-fast`. */
+  safe_search: z.boolean().optional().default(false),
+});
+
+export type TavilySearchRequest = z.infer<typeof TavilySearchRequestSchema>;
+
+// ─────────────────────────────────────────────────────────────
+// Search Response — individual result item
+// ─────────────────────────────────────────────────────────────
+
+export const TavilySearchResultSchema = z.object({
+  /** Title of the search result. */
+  title: z.string(),
+
+  /** URL of the search result. */
+  url: z.string(),
+
+  /** Content snippet from the search result (chunks). */
+  content: z.string(),
+
+  /** Relevance score of the result. */
+  score: z.number(),
+
+  /** Full raw content of the page (if include_raw_content was requested). */
+  raw_content: z.string().nullable().optional(),
+
+  /** Favicon URL of the result source. */
+  favicon: z.string().optional(),
+
+  /** Images extracted from this result (url + description if requested). */
+  images: z.array(z.unknown()).optional(),
+
+  /** Published date of the result. */
+  published_date: z.string().optional(),
+
+  /** Unique identifier for the result. */
+  id: z.string().optional(),
+});
+
+export type TavilySearchResult = z.infer<typeof TavilySearchResultSchema>;
+
+// ─────────────────────────────────────────────────────────────
+// Search Response — full search response
+// ─────────────────────────────────────────────────────────────
+
+export const TavilySearchResponseSchema = z.object({
+  /** The original search query. */
+  query: z.string(),
+
+  /** LLM-generated answer (if include_answer was true/basic/advanced). */
+  answer: z.string().nullable().optional(),
+
+  /** Query-related images (if include_images was true). */
+  images: z.array(z.unknown()).optional(),
+
+  /** List of search result items. */
+  results: z.array(TavilySearchResultSchema),
+
+  /** Time taken by Tavily to process the request (in seconds). */
+  response_time: z.union([z.string(), z.number()]),
+
+  /** Auto-detected parameters (if auto_parameters was true). */
+  auto_parameters: z
+    .object({
+      topic: z.string().optional(),
+      search_depth: z.string().optional(),
+    })
+    .optional(),
+
+  /** Usage information (if include_usage was true). */
+  usage: z
+    .object({
+      credits: z.number().optional(),
+    })
+    .optional(),
+
+  /** Unique request identifier. */
+  request_id: z.string().optional(),
+});
+
+export type TavilySearchResponse = z.infer<typeof TavilySearchResponseSchema>;

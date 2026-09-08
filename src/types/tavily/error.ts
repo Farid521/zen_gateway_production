@@ -347,6 +347,10 @@ export function createTavilyError(
   // application-level error format.
   const errorInfo = parseTavilyError(httpStatus, raw, endpoint);
 
+  // ponytail: 1-line server log tiap throw, lokasi = caller factory (stack[2])
+  const at = new Error().stack?.split("\n")[2]?.trim() ?? "";
+  console.error(`[ERROR][Tavily] ${at} endpoint=${endpoint} code=${errorInfo.code} status=${httpStatus} msg=${String(errorInfo.message).slice(0, 200)}`);
+
   // Create the actual JavaScript Error object that can be thrown.
   return new TavilyError(errorInfo);
 }

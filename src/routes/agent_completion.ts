@@ -51,7 +51,6 @@ export const agent_completion: RequestHandler = async (
     const result = await adapter.callWithFallback(parsed.data, geminiSession, opencodeIdentity.get().session);
     res.json(result);
   } catch (err: any) {
-    console.log("error")
     // thrown AgentError from adapter
     if (err instanceof AgentError) {
       const { error } = err;

@@ -20,10 +20,10 @@ import { createTavilyError } from "../../../types/tavily/error";
 import type { TavilyEndpoint } from "../../../types/tavily/error";
 
 /**
- * TavilyProvider acts as a client driver for the Tavily API,
+ * TavilyDriver acts as a client driver for the Tavily API,
  * providing methods to interact with search, extract, and crawl endpoints.
  */
-export class TavilyProvider {
+export class TavilyDriver {
   constructor() {}
 
   /**
@@ -132,7 +132,7 @@ export class TavilyProvider {
     session: TavilyApiKeySession,
     message: TavilySearchRequest,
   ): Promise<TavilySearchResponse> {
-    return TavilyProvider.request<TavilySearchResponse>(
+    return TavilyDriver.request<TavilySearchResponse>(
       session,
       "search",
       message,
@@ -158,7 +158,7 @@ export class TavilyProvider {
     message: TavilyCrawlRequest,
   ): Promise<TavilyCrawlResponse> {
     const timeoutMs = message.timeout ? message.timeout * 1000 : 30_000;
-    return TavilyProvider.request<TavilyCrawlResponse>(
+    return TavilyDriver.request<TavilyCrawlResponse>(
       session,
       "crawl",
       message,
@@ -184,7 +184,7 @@ export class TavilyProvider {
     message: TavilyExtractRequest,
   ): Promise<TavilyExtractResponse> {
     const timeoutMs = message.timeout ? message.timeout * 1000 : 30_000;
-    return TavilyProvider.request<TavilyExtractResponse>(
+    return TavilyDriver.request<TavilyExtractResponse>(
       session,
       "extract",
       message,
@@ -199,4 +199,4 @@ export class TavilyProvider {
   }
 }
 
-export default TavilyProvider;
+export default TavilyDriver;

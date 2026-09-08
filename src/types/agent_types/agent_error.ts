@@ -37,6 +37,9 @@ export function createAgentError(
   code: string | null = null,
   details?: unknown
 ): AgentError {
+  // ponytail: 1-line server log tiap throw, lokasi = caller factory (stack[2])
+  const at = new Error().stack?.split("\n")[2]?.trim() ?? "";
+  console.error(`[ERROR][Agent] ${at} type=${type} code=${code} msg=${String(message).slice(0, 200)}`);
   return new AgentError({
     message,
     type,
