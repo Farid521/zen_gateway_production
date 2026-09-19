@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction, RequestHandler } from "express";
 import { AgentCompletionRequest } from "../types/agent_types/agent_request";
-import { AgentError, createAgentError } from "../types/agent_types/agent_error";
+import { createAgentError } from "../types/agent_types/agent_error";
 import { LlmCallAdapter } from "../driver/llm/llmCallDriver";
+import { sendAgentError } from "./send_agent_error";
 import { GeminiKeysPool } from "../providers/gemini/geminiProvider";
 import { opencodeIdentity } from "../providers/opencode/opencodeIdentity";
 import type { GeminiModelId } from "../providers/gemini/geminiProviderConfig";
@@ -52,19 +53,7 @@ export const agent_completion: RequestHandler = async (
     res.json(result);
   } catch (err: any) {
     // thrown AgentError from adapter
-    if (err instanceof AgentError) {
-      const { error } = err;
-      if (error.type === "service_unavailable" || error.code === "no_model_available") {
-        res.status(503).json(err.toResponse());
-        return;
-      }
-      if (error.type === "invalid_request_error") {
-        res.status(400).json(err.toResponse());
-        return;
-      }
-      res.status(502).json(err.toResponse());
-      return;
-    }
+    if (sendAgentError(res, err)) return;
     next(err);
   }
 };

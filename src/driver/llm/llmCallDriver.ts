@@ -19,6 +19,68 @@ export function isQuotaError(status: number, errorBody: any, message: string): b
   return /quota|rate.?limit|resource.?exhausted|exceeded/i.test(message ?? "");
 }
 
+export type UpstreamErrorKind = "quota" | "transient" | "bad_request" | "auth" | "unknown";
+
+/**
+ * Menentukan jenis error upstream dari respons non-2xx.
+ * 429/kuota diperiksa lebih dulu supaya tetap punya kode sendiri.
+ */
+export function classifyUpstreamError(
+  status: number,
+  errorBody: any,
+  message: string,
+): UpstreamErrorKind {
+  // ponytail: status 5xx adalah sinyal paling kuat (mis. "Deadline exceeded" jangan sampai
+  // terbaca sebagai kuota hanya karena kata "exceeded")
+  if (status >= 500) return "transient";
+
+  if (isQuotaError(status, errorBody, message)) return "quota";
+
+  const statusText = String(errorBody?.status ?? errorBody?.type ?? "").toUpperCase();
+  const TRANSIENT_STATUS = new Set([
+    "UNAVAILABLE",
+    "INTERNAL",
+    "DEADLINE_EXCEEDED",
+    "ABORTED",
+    "UNKNOWN",
+  ]);
+  // ponytail: menangkap 503 "This model is currently experiencing high demand..."
+  const TRANSIENT_MESSAGE = /high demand|overload|temporarily|unavailable|try again|timeout|deadline/i;
+
+  if (TRANSIENT_STATUS.has(statusText) || TRANSIENT_MESSAGE.test(message ?? "")) {
+    return "transient";
+  }
+  if (status === 401 || status === 403) return "auth";
+  if (status >= 400) return "bad_request";
+  return "unknown";
+}
+
+// ponytail: content bisa string | array parts | null tergantung provider
+export function extractTextContent(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const texts = content
+      .filter((p: any) => p?.type === "text" && typeof p?.text === "string")
+      .map((p: any) => p.text as string);
+    return texts.length > 0 ? texts.join("") : null;
+  }
+  return null;
+}
+
+/**
+ * Jawaban dianggap sah kalau ada teks, ada tool_calls (flow agent), atau ada reasoning_content.
+ * Selain itu jawaban dianggap gagal supaya ikut fallback.
+ */
+export function hasUsableOutput(response: AgentCompletionResponse): boolean {
+  const message: any = response.choices?.[0]?.message;
+  if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) return true;
+  if (typeof message?.reasoning_content === "string" && message.reasoning_content.trim().length > 0) {
+    return true;
+  }
+  const text = extractTextContent(message?.content);
+  return typeof text === "string" && text.trim().length > 0;
+}
+
 export class LlmCallAdapter {
   constructor() {}
 
@@ -204,11 +266,30 @@ export class LlmCallAdapter {
         }
 
         session.release();
-        // ponytail: bedakan kuota agar callWithFallback bisa fallback, tanpa retry/backoff
-        if (isQuotaError(res.status, errorBody, message)) {
-          throw createAgentError(message, "upstream_error", null, "quota_exhausted", details);
+        // ponytail: klasifikasi error dulu, lalu beri `code` yang bisa dibaca callWithFallback
+        const kind = classifyUpstreamError(res.status, errorBody, message);
+        const upstreamDetails = {
+          upstreamStatus: res.status,
+          upstreamStatusText: errorBody?.status ?? null,
+          upstream: details ?? raw,
+        };
+
+        if (kind === "transient") {
+          // 5xx / "high demand": gangguan sementara, provider lain masih bisa melayani
+          throw createAgentError(message, "upstream_error", null, "provider_unavailable", upstreamDetails);
         }
-        throw createAgentError(message, "upstream_error", null, code, details);
+        if (kind === "quota") {
+          throw createAgentError(message, "upstream_error", null, "quota_exhausted", upstreamDetails);
+        }
+        if (kind === "bad_request") {
+          // 400 belum jelas salah siapa: dicoba dulu ke DeepSeek di callWithFallback
+          throw createAgentError(message, "invalid_request_error", null, "upstream_bad_request", upstreamDetails);
+        }
+        if (kind === "auth") {
+          // 401/403: kredensial kita yang bermasalah, bukan request pengguna
+          throw createAgentError(message, "upstream_error", null, "upstream_auth_error", upstreamDetails);
+        }
+        throw createAgentError(message, "upstream_error", null, code, upstreamDetails);
       }
 
       // Parse upstream success payload.
@@ -276,7 +357,8 @@ export class LlmCallAdapter {
     if (!deepseekConfig.apiKey) {
       throw createAgentError(
         "DeepSeek API key is missing (DEEPSEEK_API_KEY)",
-        "invalid_request_error",
+        // ponytail: salah konfigurasi server, bukan salah pengguna -> 503 bukan 400
+        "service_unavailable",
         null,
         "missing_deepseek_key",
       );
@@ -336,11 +418,27 @@ export class LlmCallAdapter {
           details = raw;
         }
 
-        // ponytail: reuse isQuotaError (terverifikasi 24/24 lawan 429 asli)
-        if (isQuotaError(res.status, errorBody, message)) {
-          throw createAgentError(message, "upstream_error", null, "quota_exhausted", details);
+        // ponytail: kode error disamakan dengan jalur Gemini supaya callWithFallback konsisten
+        const kind = classifyUpstreamError(res.status, errorBody, message);
+        const upstreamDetails = {
+          upstreamStatus: res.status,
+          upstreamStatusText: errorBody?.status ?? errorBody?.type ?? null,
+          upstream: details ?? raw,
+        };
+
+        if (kind === "quota") {
+          throw createAgentError(message, "upstream_error", null, "quota_exhausted", upstreamDetails);
         }
-        throw createAgentError(message, "upstream_error", null, code, details);
+        if (kind === "bad_request") {
+          throw createAgentError(message, "invalid_request_error", null, "upstream_bad_request", upstreamDetails);
+        }
+        if (kind === "auth") {
+          throw createAgentError(message, "upstream_error", null, "upstream_auth_error", upstreamDetails);
+        }
+        if (kind === "transient") {
+          throw createAgentError(message, "upstream_error", null, "provider_unavailable", upstreamDetails);
+        }
+        throw createAgentError(message, "upstream_error", null, code, upstreamDetails);
       }
 
       const data = await res.json();
@@ -387,31 +485,67 @@ export class LlmCallAdapter {
     geminiSession: ReservedGeminiKey | null | undefined,
     _opencodeSessionId?: string,
   ): Promise<AgentCompletionResponse> {
-    // ponytail: error gemini apa pun -> deepseek, tanpa opencode
+    // ponytail: request yang sudah lolos validasi route selalu dicoba ke deepseek kalau gemini gagal.
+    // yang tidak ditolak di route = bukan salah pengguna, jadi provider lain perlu dicoba.
     const OK = "\x1b[32m[LLM:OK]\x1b[0m";
     const FAIL = "\x1b[33m[LLM:FALLBACK]\x1b[0m";
+
     if (!geminiSession) {
       const t0 = performance.now();
       const r = await this.callDeepseekAdapter(request);
       console.log(`${OK} provider=deepseek model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
       return r;
     }
+
     try {
       const t0 = performance.now();
       const r = await this.callGeminiAdapter(request, geminiSession);
+      // ponytail: jawaban kosong dianggap gagal supaya ikut fallback, bukan dikirim apa adanya
+      if (!hasUsableOutput(r)) {
+        throw createAgentError(
+          "Upstream returned empty content.",
+          "upstream_error",
+          null,
+          "invalid_upstream_response",
+        );
+      }
       console.log(`${OK} provider=gemini model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
       return r;
     } catch (e: any) {
-      // ponytail: hanya fallback untuk quota/timeout, 400 validasi (thought_signature etc) langsung throw
-      const code = e?.error?.code;
-      const isQuota = code === "quota_exhausted";
-      const isTimeout = code === "provider_timeout";
-      if (!isQuota && !isTimeout) throw e;
-      console.log(`${FAIL} gemini=${geminiSession.modelId} err=${e?.message} -> deepseek`);
-      const t0 = performance.now();
-      const r = await this.callDeepseekAdapter(request);
-      console.log(`${OK} provider=deepseek model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
-      return r;
+      const geminiError: AgentError = e instanceof AgentError
+        ? e
+        : createAgentError(
+            e?.message ?? "Unknown upstream error",
+            "upstream_error",
+            null,
+            "provider_error",
+          );
+      const upstreamStatus = (geminiError.error.details as any)?.upstreamStatus ?? "-";
+      console.log(
+        `${FAIL} gemini=${geminiSession.modelId} code=${geminiError.error.code} status=${upstreamStatus} err=${geminiError.message} -> deepseek`,
+      );
+
+      try {
+        const t0 = performance.now();
+        const r = await this.callDeepseekAdapter(request);
+        if (!hasUsableOutput(r)) {
+          throw createAgentError(
+            "Upstream returned empty content.",
+            "upstream_error",
+            null,
+            "invalid_upstream_response",
+          );
+        }
+        console.log(`${OK} provider=deepseek model=${r.model} latency=${Math.round(performance.now() - t0)}ms`);
+        return r;
+      } catch (dsErr: any) {
+        // ponytail: dua provider sama-sama menolak 400 -> request-nya memang salah pengguna,
+        // jadi pakai pesan Gemini (provider utama) supaya pesannya tetap relevan
+        if (dsErr instanceof AgentError && dsErr.error.code === "upstream_bad_request") {
+          throw geminiError.error.code === "upstream_bad_request" ? geminiError : dsErr;
+        }
+        throw dsErr;
+      }
     }
   }
 }
