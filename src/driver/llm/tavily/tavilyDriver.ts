@@ -37,7 +37,8 @@ export class TavilyDriver {
     schema: z.ZodSchema<TResponse>,
     options: {
       timeoutMs?: number;
-      emptyCheck?: (data: TResponse) => boolean;
+      /** Hanya untuk observability: hasil kosong tetap 200, tidak lagi dilempar sebagai error. */
+      isEmpty?: (data: TResponse) => boolean;
       emptyMessage?: string;
     } = {},
   ): Promise<TResponse> {
@@ -83,12 +84,12 @@ export class TavilyDriver {
         );
       }
 
-      // Ensure at least one result is returned (if check provided)
-      if (options.emptyCheck && options.emptyCheck(parsed.data)) {
-        throw createTavilyError(
-          200,
-          options.emptyMessage ?? "no results found",
-          endpoint,
+      // ponytail: hasil kosong BUKAN error. Tavily membalas 200 saat tidak menemukan apa pun,
+      // jadi dulu ini di-throw sebagai code UNKNOWN -> route membalas 502, sehingga
+      // "tidak ada hasil" tampak seperti gateway rusak. Sekarang dicatat saja lalu diteruskan.
+      if (options.isEmpty && options.isEmpty(parsed.data)) {
+        console.warn(
+          `[Tavily] empty results endpoint=${endpoint} msg=${options.emptyMessage ?? "no results found"}`,
         );
       }
 
@@ -126,7 +127,7 @@ export class TavilyDriver {
    * @param session - The API key session containing a valid key for authorization.
    * @param message - The search request parameters.
    * @returns A promise resolving to the full search response.
-   * @throws TavilyError if the request fails, times out, or returns no results.
+   * @throws TavilyError if the request fails or times out (hasil kosong tetap sukses).
    */
   public async search(
     session: TavilyApiKeySession,
@@ -139,7 +140,7 @@ export class TavilyDriver {
       TavilySearchResponseSchema,
       {
         timeoutMs: 30_000,
-        emptyCheck: (data) => data.results.length === 0,
+        isEmpty: (data) => data.results.length === 0,
         emptyMessage: "no search results found",
       },
     );
@@ -151,7 +152,7 @@ export class TavilyDriver {
    * @param session - The API key session containing a valid key for authorization.
    * @param message - The crawl request parameters.
    * @returns A promise resolving to the full crawl response.
-   * @throws TavilyError if the request fails, times out, or returns no results.
+   * @throws TavilyError if the request fails or times out (hasil kosong tetap sukses).
    */
   public async crawl(
     session: TavilyApiKeySession,
@@ -165,7 +166,7 @@ export class TavilyDriver {
       TavilyCrawlResponseSchema,
       {
         timeoutMs,
-        emptyCheck: (data) => data.results.length === 0,
+        isEmpty: (data) => data.results.length === 0,
         emptyMessage: "no crawl results found",
       },
     );
@@ -177,7 +178,7 @@ export class TavilyDriver {
    * @param session - The API key session containing a valid key for authorization.
    * @param message - The extract request parameters.
    * @returns A promise resolving to the full extract response.
-   * @throws TavilyError if the request fails, times out, or returns no results.
+   * @throws TavilyError if the request fails or times out (hasil kosong tetap sukses).
    */
   public async extract(
     session: TavilyApiKeySession,
@@ -191,7 +192,7 @@ export class TavilyDriver {
       TavilyExtractResponseSchema,
       {
         timeoutMs,
-        emptyCheck: (data) =>
+        isEmpty: (data) =>
           data.results.length === 0 && data.failed_results.length === 0,
         emptyMessage: "no extract results found",
       },
