@@ -77,6 +77,29 @@ export const TavilySearchRequestSchema = z.object({
 
   /** Enterprise only: whether to filter out adult or unsafe content. Not supported for `fast` or `ultra-fast`. */
   safe_search: z.boolean().optional().default(false),
+
+  /** Filter by exact publication year (1900-2100). Added for agent_swarm_mcp compatibility. */
+  tahun: z.number().int().min(1900).max(2100).optional(),
+
+  /** Filter by start year of range (1900-2100). Use with tahun_to for range. */
+  tahun_from: z.number().int().min(1900).max(2100).optional(),
+
+  /** Filter by end year of range (1900-2100). Use with tahun_from for range. */
+  tahun_to: z.number().int().min(1900).max(2100).optional(),
+}).superRefine((v, ctx) => {
+  if (v.tahun !== undefined && (v.tahun_from !== undefined || v.tahun_to !== undefined)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Use either tahun for exact year, or tahun_from/tahun_to for range. tahun cannot be combined with tahun_from/tahun_to",
+    });
+  }
+  if (v.tahun_from !== undefined && v.tahun_to !== undefined && v.tahun_from > v.tahun_to) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "tahun_from must be <= tahun_to",
+      path: ["tahun_from"],
+    });
+  }
 });
 
 export type TavilySearchRequest = z.infer<typeof TavilySearchRequestSchema>;

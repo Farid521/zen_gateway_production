@@ -35,6 +35,19 @@ function noKey(res: any, endpoint: TavilyEndpoint) {
   });
 }
 
+function toUpstreamSearchBody(data: any): any {
+  const { tahun, tahun_from, tahun_to, ...rest } = data;
+  const body: any = { ...rest };
+  if (tahun !== undefined) {
+    body.start_date = `${tahun}-01-01`;
+    body.end_date = `${tahun}-12-31`;
+  } else {
+    if (tahun_from !== undefined) body.start_date = `${tahun_from}-01-01`;
+    if (tahun_to !== undefined) body.end_date = `${tahun_to}-12-31`;
+  }
+  return body;
+}
+
 export const tavily_search: RequestHandler = async (req, res, next) => {
   const parsed = TavilySearchRequestSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -46,7 +59,8 @@ export const tavily_search: RequestHandler = async (req, res, next) => {
   const session = provider.getApiKey();
   if (!session.apiKey) { noKey(res, "search"); return; }
   try {
-    res.json(await driver.search(session, parsed.data));
+    const upstreamBody = toUpstreamSearchBody(parsed.data);
+    res.json(await driver.search(session, upstreamBody));
   } catch (err: any) {
     if (err instanceof TavilyError) { sendTavilyError(res, err); return; }
     next(err);
